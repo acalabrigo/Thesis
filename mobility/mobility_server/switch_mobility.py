@@ -74,7 +74,7 @@ class MobilitySwitch (EventMixin):
         self.hold_down_expired = _flood_delay == 0
 
         # set up listener for host events
-        listen_args={'host_tracker':{'priority':0}}
+        listen_args={'server_mobility':{'priority':0}}
         core.listen_to_dependencies(self, listen_args=listen_args)
 
     def _handle_host_tracker_HostEvent(self, event):
