@@ -56,9 +56,10 @@ class MobilitySwitch (EventMixin):
     """
     _eventMixin_events = set([NewHostEvent])
 
-    def __init__ (self, connection):
+    def __init__ (self, connection, transparent):
         # Switch we'll be adding mobility capabilities to
         self.connection = connection
+        self.transparent = transparent
 
         # Our table
         self.macToPort = {}
@@ -66,6 +67,7 @@ class MobilitySwitch (EventMixin):
         # We want to hear PacketIn messages, so we listen
         # to the connection
         connection.addListeners(self)
+        self.hold_down_expired = _flood_delay == 0
 
         # set up listener for host events
         listen_args={'host_tracker':{'priority':0}}
@@ -137,9 +139,10 @@ class MobilitySwitch (EventMixin):
 
         self.macToPort[packet.src] = event.port # 1
 
-        if packet.type == packet.LLDP_TYPE or packet.dst.isBridgeFiltered():
-            drop() # 2a
-            return
+        if not self.transparent: # 2
+            if packet.type == packet.LLDP_TYPE or packet.dst.isBridgeFiltered():
+                drop() # 2a
+                return
 
         if packet.dst.is_multicast:
             flood() # 3a
@@ -171,13 +174,20 @@ class switch_mobility (object):
   Waits for OpenFlow switches to connect and enables mobility on them
   switches.
   """
-  def __init__ (self):
+  def __init__ (self, transparent):
     core.openflow.addListeners(self)
+    self.transparent = transparent
 
   def _handle_ConnectionUp (self, event):
     log.debug("Connection %s" % (event.connection,))
-    MobilitySwitch(event.connection)
+    MobilitySwitch(event.connection, self.transparent)
 
 
-def launch ():
-  core.registerNew(switch_mobility)
+def launch (transparent=False, hold_down=_flood_delay):
+    try:
+        global _flood_delay
+        _flood_delay = int(str(hold_down), 10)
+        assert _flood_delay >= 0
+    except:
+        raise RuntimeError("Expected hold-down to be a number")
+    core.registerNew(switch_mobility)
