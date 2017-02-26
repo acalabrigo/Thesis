@@ -129,6 +129,8 @@ class server_mobility (EventMixin):
     def __init__ (self):
         # The following tables should go to Topology later
         self.entryByMAC = {}
+        listen_args={'openflow':{'priority':0}}
+        core.listen_to_dependencies(self, listen_args=listen_args)
 
     def _all_dependencies_met (self):
         log.info("server_mobility ready")
