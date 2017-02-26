@@ -137,10 +137,9 @@ class MobilitySwitch (EventMixin):
 
         self.macToPort[packet.src] = event.port # 1
 
-        if not self.transparent: # 2
-            if packet.type == packet.LLDP_TYPE or packet.dst.isBridgeFiltered():
-                drop() # 2a
-                return
+        if packet.type == packet.LLDP_TYPE or packet.dst.isBridgeFiltered():
+            drop() # 2a
+            return
 
         if packet.dst.is_multicast:
             flood() # 3a
