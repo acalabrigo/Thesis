@@ -31,6 +31,8 @@ import pox
 
 log = core.getLogger()
 
+_flood_delay = 0
+
 class NewHostEvent(Event):
     """
     Event when new host joins network.
