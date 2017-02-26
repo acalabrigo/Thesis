@@ -93,12 +93,12 @@ class MacEntry (object):
     services, and it may replace dpid by a general switch object reference
     We use the port to determine which port to forward traffic out of.
     """
-    def __init__ (self, dpid, port, macaddr, ipaddr):
+    def __init__ (self, dpid, port, macaddr):
         super(MacEntry,self).__init__()
         self.dpid = dpid
         self.port = port
         self.macaddr = macaddr
-        self.ipaddr = ipaddr
+        #self.ipaddr = ipaddr
 
     def __str__(self):
         return ' '.join([str(self.dpid), str(self.port), str(self.macaddr)])
