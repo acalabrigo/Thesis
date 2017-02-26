@@ -72,19 +72,19 @@ class HostEvent (Event):
 
     @property
     def new_dpid (self):
-    """
-    New DPID for move events"
-    """
-    assert self.move
-    return self._new_dpid
+        """
+        New DPID for move events"
+        """
+        assert self.move
+        return self._new_dpid
 
     @property
     def new_port (self):
-    """
-    New port for move events"
-    """
-    assert self.move
-    return self._new_port
+        """
+        New port for move events"
+        """
+        assert self.move
+        return self._new_port
 
 class MacEntry (object):
     """
