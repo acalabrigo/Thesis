@@ -20,7 +20,7 @@ class host_listener(object):
     Basically, just want to test that we can listen to the events
     raised by the host_tracker.
     """
-    def __init__():
+    def __init__(self):
         listen_args={'host_tracker':{'priority':0}}
         core.listen_to_dependencies(self, listen_args=listen_args)
 
@@ -32,3 +32,4 @@ class host_listener(object):
 
 def launch():
     core.registerNew(host_listener)
+v
