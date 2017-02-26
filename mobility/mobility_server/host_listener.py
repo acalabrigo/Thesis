@@ -28,8 +28,7 @@ class host_listener(object):
         log.info("host_listener ready")
 
     def _handle_host_tracker_HostEvent(self, event):
-        log.info("HostEvent listened to")
+        log.info("HostEvent listened to {0}".format(str(event.entry)))
 
 def launch():
     core.registerNew(host_listener)
-v
