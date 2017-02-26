@@ -26,6 +26,8 @@ from pox.lib.revent import Event, EventHalt
 import pox.openflow.libopenflow_01 as of
 import pox.openflow.discovery as discovery
 from pox.lib.revent.revent import *
+from pox.lib.util import dpid_to_str
+from pox.lib.util import str_to_bool
 import time
 import pox
 
@@ -192,4 +194,4 @@ def launch (transparent=False, hold_down=_flood_delay):
         assert _flood_delay >= 0
     except:
         raise RuntimeError("Expected hold-down to be a number")
-    core.registerNew(switch_mobility)
+    core.registerNew(switch_mobility, str_to_bool(transparent))
