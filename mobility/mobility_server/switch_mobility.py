@@ -77,7 +77,7 @@ class MobilitySwitch (EventMixin):
         listen_args={'server_mobility':{'priority':0}}
         core.listen_to_dependencies(self, listen_args=listen_args)
 
-    def _handle_host_tracker_HostEvent(self, event):
+    def _handle_server_mobility_HostEvent(self, event):
         log.info("HostEvent listened to {0}".format(str(event.entry)))
 
         # if the host event occurred on this switch
