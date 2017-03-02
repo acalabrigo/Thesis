@@ -93,12 +93,12 @@ class MacEntry (object):
     services, and it may replace dpid by a general switch object reference
     We use the port to determine which port to forward traffic out of.
     """
-    def __init__ (self, dpid, port, macaddr):
+    def __init__ (self, dpid, port, macaddr, ipaddr=None):
         super(MacEntry,self).__init__()
         self.dpid = dpid
         self.port = port
         self.macaddr = macaddr
-        #self.ipaddr = ipaddr
+        self.ipaddr = ipaddr
 
     def __str__(self):
         return ' '.join([str(self.dpid), str(self.port), str(self.macaddr)])
@@ -112,8 +112,9 @@ class MacEntry (object):
         if self.dpid != other.dpid: return False
         if self.port != other.port: return False
         if self.macaddr != other.macaddr: return False
+        if self.ipaddr != other.ipaddr: return False
         if self.dpid != other.dpid: return False
-        # What about ipAddrs??
+
         return True
 
     def __ne__ (self, other):
@@ -143,6 +144,25 @@ class server_mobility (EventMixin):
             result = None
         return result
 
+    def getSrcIP (self, packet):
+        """
+        Gets source IPv4 address for packets that have one (IPv4 and ARP)
+        Returns (ip_address, has_arp).  If no IP, returns (None, False).
+        """
+        if isinstance(packet, ipv4):
+            log.debug("IP %s => %s",str(packet.srcip),str(packet.dstip))
+            return packet.srcip
+        elif isinstance(packet, arp):
+            log.debug("ARP %s %s => %s",
+                {arp.REQUEST:"request",arp.REPLY:"reply"}.get(packet.opcode,
+                'op:%i' % (packet.opcode,)),
+                str(packet.protosrc), str(packet.protodst))
+            if (packet.hwtype == arp.HW_TYPE_ETHERNET and
+                packet.prototype == arp.PROTO_TYPE_IP and
+                packet.protosrc != 0):
+                return packet.protosrc
+        return None
+
     def _handle_openflow_PacketIn (self, event):
         """
         Populate MAC and IP tables based on incoming packets.
@@ -169,30 +189,31 @@ class server_mobility (EventMixin):
             log.debug("%i %i ignoring packetIn at switch-only port", dpid, inport)
             return
 
-        log.debug("PacketIn: %i %i ETH %s => %s",
-            dpid, inport, str(packet.src), str(packet.dst))
+        #log.debug("PacketIn: %i %i ETH %s => %s",
+        #    dpid, inport, str(packet.src), str(packet.dst))
 
         # Learn or update dpid/port/MAC info
         macEntry = self.getMacEntry(packet.src)
         if macEntry is None:
             # there is no known host by that MAC
-            # should we raise a NewHostFound event (at the end)?
-            log.info(packet.type)
+            #log.info(packet.type)
+            log.info(self.getSrcIP(packet.next))
             macEntry = MacEntry(dpid, inport, packet.src)
             self.entryByMAC[packet.src] = macEntry
             log.info("Learned %s", str(macEntry))
-            self.raiseEventNoErrors(HostEvent, macEntry, join=True)
+            #self.raiseEventNoErrors(HostEvent, macEntry, join=True)
         elif macEntry != (dpid, inport, packet.src):
             # there is already an entry of host with that MAC, but host has moved
             # should we raise a HostMoved event (at the end)?
             log.info("Learned %s moved to %i %i", str(macEntry), dpid, inport)
-
-            # should we create a whole new entry, or keep the previous host info?
-            # for now, we keep it: IP info, answers pings, etc.
             e = HostEvent(macEntry, move=True, new_dpid = dpid, new_port = inport)
             self.raiseEventNoErrors(e)
             macEntry.dpid = e._new_dpid
             macEntry.inport = e._new_port
+
+        #pckt_srcip = self.getSrcIP(packet.next)
+        #if pckt_srcip is not None:
+        #    self.updateIPInfo(pckt_srcip,macEntry,hasARP)
 
 def launch ():
     core.registerNew(server_mobility)
