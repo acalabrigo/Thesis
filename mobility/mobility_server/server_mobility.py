@@ -211,8 +211,9 @@ class server_mobility (EventMixin):
             macEntry.dpid = e._new_dpid
             macEntry.inport = e._new_port
 
-        #pckt_srcip = self.getSrcIP(packet.next)
-        #if pckt_srcip is not None:
+        pckt_srcip = self.getSrcIP(packet.next)
+        if pckt_srcip is not None:
+             log.info("IP: {0}".format(pckt_srcip))
         #    self.updateIPInfo(pckt_srcip,macEntry,hasARP)
 
 def launch ():
