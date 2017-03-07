@@ -34,6 +34,7 @@ import pox
 log = core.getLogger()
 
 _flood_delay = 0
+DEFAULT_SIPS = ["192.168.1.1", "192.168.2.1"]
 
 class NewHostEvent(Event):
     """
@@ -60,10 +61,11 @@ class MobilitySwitch (EventMixin):
     """
     _eventMixin_events = set([NewHostEvent])
 
-    def __init__ (self, connection, transparent):
+    def __init__ (self, connection, transparent, ip):
         # Switch we'll be adding mobility capabilities to
         self.connection = connection
         self.transparent = transparent
+        self.ip = ip
 
         # Our table
         self.macToPort = {}
@@ -77,6 +79,8 @@ class MobilitySwitch (EventMixin):
         listen_args={'server_mobility':{'priority':0}}
         core.listen_to_dependencies(self, listen_args=listen_args)
 
+        log.info("Added switch: dpid {0} ip {1}".format(self.connection.dpid, self.ip))
+        
     def _handle_server_mobility_HostEvent(self, event):
         log.info("HostEvent listened to {0}".format(str(event.entry)))
 
@@ -174,24 +178,37 @@ class MobilitySwitch (EventMixin):
 
 
 class switch_mobility (object):
-  """
-  Waits for OpenFlow switches to connect and enables mobility on them
-  switches.
-  """
-  def __init__ (self, transparent):
-    core.openflow.addListeners(self)
-    self.transparent = transparent
+    """
+    Waits for OpenFlow switches to connect and enables mobility on the
+    switches.
+    """
+    def __init__ (self, transparent, sips):
+        core.openflow.addListeners(self)
+        self.transparent = transparent
+        self.sips = sips
+        self.sip_index = 0
 
-  def _handle_ConnectionUp (self, event):
-    log.debug("Connection %s" % (event.connection,))
-    MobilitySwitch(event.connection, self.transparent)
+    def _handle_ConnectionUp (self, event):
+        try:
+            log.debug("Connection %s" % (event.connection,))
+            MobilitySwitch(event.connection, self.transparent,
+                self.sips[self.sip_index])
+            self.sip_index += 1
+        except:
+            raise RuntimeError("Out of switch IPs")
 
 
-def launch (transparent=False, hold_down=_flood_delay):
+def launch (transparent=False, sips=DEFAULT_SIPS, hold_down=_flood_delay):
     try:
         global _flood_delay
         _flood_delay = int(str(hold_down), 10)
         assert _flood_delay >= 0
     except:
         raise RuntimeError("Expected hold-down to be a number")
-    core.registerNew(switch_mobility, str_to_bool(transparent))
+
+    try:
+        assert sips is not None
+    except:
+        raise RuntimeError("Invalid switch IPs")
+
+    core.registerNew(switch_mobility, str_to_bool(transparent), sips)

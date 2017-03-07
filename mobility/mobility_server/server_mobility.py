@@ -210,11 +210,13 @@ class server_mobility (EventMixin):
             self.raiseEventNoErrors(e)
             macEntry.dpid = e._new_dpid
             macEntry.inport = e._new_port
-
-        pckt_srcip = self.getSrcIP(packet.next)
-        if pckt_srcip is not None:
-             log.info("IP: {0}".format(pckt_srcip))
-        #    self.updateIPInfo(pckt_srcip,macEntry,hasARP)
+        else:
+            # we already have an entry for this
+            if macEntry.ipaddr is not None:
+                pckt_srcip = self.getSrcIP(packet.next)
+                if pckt_srcip is not None:
+                     macEntry.ipaddr = pckt_srcip
+                     self.raiseEventNoErrors(HostEvent, macEntry, join=True)
 
 def launch ():
     core.registerNew(server_mobility)
