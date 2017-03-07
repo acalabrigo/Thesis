@@ -130,7 +130,7 @@ class server_mobility (EventMixin):
     def __init__ (self):
         # The following tables should go to Topology later
         self.entryByMAC = {}
-        listen_args={'openflow':{'priority':0}}
+        listen_args={'openflow':{'priority':0}, 'switch_mobility':{'priority':0}}
         core.listen_to_dependencies(self, listen_args=listen_args)
 
     def _all_dependencies_met (self):
@@ -177,6 +177,7 @@ class server_mobility (EventMixin):
         dpid = event.connection.dpid
         inport = event.port
         packet = event.parsed
+        log.info("server dpid: {0} port: {1}".format(dpid, inport))
         if not packet.parsed:
             log.warning("%i %i ignoring unparsed packet", dpid, inport)
             return
