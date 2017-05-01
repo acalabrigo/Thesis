@@ -45,6 +45,17 @@ class Host (object):
     self.mac = mac
     self.entry = entry
 
+  def get_ip(self):
+    '''
+    Retrieve the IP address of this host from the MAC entry.
+    '''
+
+    ips = self.entry.ipAddrs.keys()
+    if len(ips) > 0:
+      return ips[0]
+    else:
+      return None
+
 class DynamicTopology (object):
   '''
   POX module that creates a dynamic adjacency list representation of the
@@ -185,6 +196,18 @@ class DynamicTopology (object):
         del s2.ports[s2_port]
         if s1_id not in s2.ports.values() and self.graph.has_key(s2):
           self.graph[s2].remove(s1_id)
+
+  def get_host_mac_by_ip(self, ip):
+    '''
+    Allows us to look up host MAC addresses by IP address, like
+    what ARP does.
+    '''
+
+    for host in self.hosts.values():
+      hip = host.get_ip()
+      if hip == ip:
+          return host.entry.macaddr
+    return None
 
 def launch(debug="False"):
     import pox.topology

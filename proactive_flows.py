@@ -2,6 +2,10 @@
 # 2017 Adam Calabrigo
 
 from pox.core import core
+from pox.lib.addresses import EthAddr, IPAddr
+from pox.lib.packet.ethernet import ethernet
+from pox.lib.packet.ipv4 import ipv4
+from pox.lib.packet.arp import arp
 from pox.lib.recoco import Timer
 from pox.lib.revent import Event, EventHalt
 import pox.openflow.libopenflow_01 as of
@@ -15,9 +19,13 @@ log = core.getLogger()
 
 all_ports = of.OFPP_FLOOD
 
+def dpid_to_mac (dpid):
+    return EthAddr("%012x" % (dpid & 0xffFFffFFffFF,))
+
 class ProactiveFlows (object):
   def __init__ (self):
     # need to access the graph in dynamic_topology for proactive routes
+    core.openflow.addListeners(self)
     core.listen_to_dependencies(self, ['dynamic_topology'], short_attrs=True)
 
   def _all_dependencies_met (self):
@@ -36,7 +44,7 @@ class ProactiveFlows (object):
         return False
     return True
 
-  def find_shortest_path (self, start, end, path=[]):
+  def find_shortest_path (self, graph, start, end, path=[]):
     '''
     Finds the shortest path between two devices.
     '''
@@ -44,12 +52,12 @@ class ProactiveFlows (object):
     path = path + [start]
     if start == end:
       return path
-    if not self.dynamic_topology.graph.has_key(start):
+    if not graph.has_key(start):
       return None
     shortest = None
-    for node in self.dynamic_topology.graph[start]:
+    for node in graph[start]:
       if node not in path:
-        newpath = self.find_shortest_path(node, end, path)
+        newpath = self.find_shortest_path(graph, node, end, path)
         if newpath:
           if not shortest or len(newpath) < len(shortest):
             shortest = newpath
@@ -82,9 +90,13 @@ class ProactiveFlows (object):
 
       # retrieve graph info, find shortest path between devices
       log.info("Looking for path from {0} to {1}".format(packet.src, packet.dst))
-      path = self.find_shortest_path(packet.src, packet.dst)
+      graph = self.dynamic_topology.graph.copy()
+      path = self.find_shortest_path(graph, str(packet.src), str(packet.dst))
       log.info("path found: {0}".format(path))
 
+      if path is None:
+          log.info("No path found, waiting on host_tracker")
+          return
       for i in range(1, len(path) - 1):
         device = path[i]
         log.info("adding flows to {0}".format(device))
@@ -95,18 +107,24 @@ class ProactiveFlows (object):
           # flow mod for outgoing packets
           msg = of.ofp_flow_mod()
           msg.match.dl_dst = packet.dst
-          msg.match.dl_src = packet.src
-          msg.actions.append(of.ofp_action_output(port =
-            self.dynamic_topology.switches[device].get_device_port(path[i + 1])))
-          self.dynamic_topology.switches[device].connection.send(msg)
+          #msg.match.dl_src = packet.src
+          port = self.dynamic_topology.switches[device].get_device_port(path[i + 1])
+          if port is None:
+            log.info("Could not find {0} in {1}'s port table'".format(path[i + 1], device))
+          else:
+            msg.actions.append(of.ofp_action_output(port = port))
+            self.dynamic_topology.switches[device].connection.send(msg)
 
           # flow mod for return packets
           msg = of.ofp_flow_mod()
           msg.match.dl_dst = packet.src
-          msg.match.dl_src = packet.dst
-          msg.actions.append(of.ofp_action_output(port =
-            self.dynamic_topology.switches[device].get_device_port(path[i - 1])))
-          self.dynamic_topology.switches[device].connection.send(msg)
+          #msg.match.dl_src = packet.dst
+          port = self.dynamic_topology.switches[device].get_device_port(path[i - 1])
+          if port is None:
+            log.info("Could not find {0} in {1}'s port table'".format(path[i - 1], device))
+          else:
+            msg.actions.append(of.ofp_action_output(port = port))
+            self.dynamic_topology.switches[device].connection.send(msg)
 
         else:   # central, so add flows for IP
 
@@ -114,25 +132,32 @@ class ProactiveFlows (object):
           msg = of.ofp_flow_mod()
           msg.match.dl_type = ethernet.IP_TYPE
           msg.match.nw_dst = ip_packet.dstip
-          msg.match.nw_src = ip_packet.srcip
-          msg.actions.append(of.ofp_action_output(port =
-            self.dynamic_topology.switches[device].get_device_port(path[i + 1])))
-          self.dynamic_topology.switches[device].connection.send(msg)
+          #msg.match.nw_src = ip_packet.srcip
+          port = self.dynamic_topology.switches[device].get_device_port(path[i + 1])
+          if port is None:
+            log.info("Could not find {0} in {1}'s port table'".format(path[i + 1], device))
+          else:
+            msg.actions.append(of.ofp_action_output(port = port))
+            self.dynamic_topology.switches[device].connection.send(msg)
 
           # flow mod for return packets
           msg = of.ofp_flow_mod()
           msg.match.dl_type = ethernet.IP_TYPE
           msg.match.nw_dst = ip_packet.srcip
-          msg.match.nw_src = ip_packet.dstip
-          msg.actions.append(of.ofp_action_output(port =
-            self.dynamic_topology.switches[device].get_device_port(path[i - 1])))
-          self.dynamic_topology.switches[device].connection.send(msg)
+          #msg.match.nw_src = ip_packet.dstip
+          port = self.dynamic_topology.switches[device].get_device_port(path[i - 1])
+          if port is None:
+            log.info("Could not find {0} in {1}'s port table'".format(path[i - 1], device))
+          else:
+            msg.actions.append(of.ofp_action_output(port = port))
+            self.dynamic_topology.switches[device].connection.send(msg)
 
     # CASE: the switch gets an ARP request from a host. In this case,
     # create an ARP reply based on the known network topology. Send this
     # back out the input port on the switch.
-    '''elif isinstance(packet.next, arp):
+    elif isinstance(packet.next, arp):
       arp_packet = packet.next
+
       log.info("%i %i ARP %s %s => %s", dpid, event.port,
           {arp.REQUEST:"request",arp.REPLY:"reply"}.get(arp_packet.opcode,
           'op:%i' % (arp_packet.opcode,)), str(arp_packet.protosrc),
@@ -153,9 +178,14 @@ class ProactiveFlows (object):
               arp_reply.hwdst = arp_packet.hwsrc
               arp_reply.protodst = arp_packet.protosrc
               arp_reply.protosrc = arp_packet.protodst
-              arp_reply.hwsrc = self.get_host_mac(arp_packet.protodst)
+              arp_reply.hwsrc = self.dynamic_topology.get_host_mac_by_ip(
+                arp_packet.protodst)
+
               if arp_reply.hwsrc is None:
-                log.info("problem here")
+                #log.info("Host unknown, broadcasting ARP")
+                #msg = of.ofp_packet_out(data = event.ofp)
+                #msg.actions.append(of.ofp_action_output(port = all_ports))
+                #event.connection.send(msg)
                 return
 
               # create an Ethernet header and encapsulate
@@ -172,7 +202,7 @@ class ProactiveFlows (object):
 
               log.info("%i %i answering ARP for %s" % (dpid, event.port,
                   str(arp_reply.protosrc)))
-              return'''
+              return
     else:
       # for now, do nothing for this
       return
