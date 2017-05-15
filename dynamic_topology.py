@@ -11,6 +11,7 @@ import pox.openflow.discovery as discovery
 import pox.openflow.topology as of_topo
 from pox.lib.revent.revent import *
 from pox.lib.util import dpid_to_str, str_to_bool
+import time
 import pox
 
 log = core.getLogger()
@@ -56,33 +57,65 @@ class Host (object):
     else:
       return None
 
-class DynamicTopology (object):
+class StableEvent (Event):
+  '''
+  Event when the topology has not experienced any changes in a
+  predetermined interval of time.
+  '''
+
+  def __init__(self, stable):
+    super(StableEvent, self).__init__();
+    self.stable = stable
+
+class DynamicTopology (EventMixin):
   '''
   POX module that creates a dynamic adjacency list representation of the
   network topology. Uses the openflow.discovery module to track link changes
   and the host_tracker module to track host locations and MAC/IPs.
   '''
 
-  def __init__ (self, debug=False):
+  _eventMixin_events = set([StableEvent])
+
+  def __init__ (self, debug=False, check_interval=5.0):
     core.listen_to_dependencies(self)
     self.switches = {} # dpid -> Switch
     self.hosts = {} # mac -> Host
     self.graph = {}
 
-    if debug is True:
-      self.timer = Timer(10.0, self._timer_handler, recurring=True)
+    self.debug = debug
 
-  def _timer_handler (self):
+    self.stable = False
+    self.last_stable = self.stable
+    self.last_check = time.time()
+    self.check_interval = check_interval
+    self._t = Timer(self.check_interval, self._check_stability, recurring=True)
+
+  def _check_stability (self):
     '''
-    Print out information for debugging.
+    See if our network has undergone changes.
     '''
 
-    log.info("----- DEBUG -----")
-    for s in self.switches.items():
-      log.info("switch {0} : ports {1}".format(s[0], s[1].ports))
-    for h in self.hosts.items():
-      log.info("host {0} : has ip {1}".format(h[0], h[1].entry.ipAddrs.keys()))
-    log.info("graph: {0}".format(self.graph))
+    # if the network status has changed, raise event
+    if self.stable != self.last_stable:
+      self.raiseEventNoErrors(StableEvent, stable=self.stable)
+      self.last_stable, self.last_check = self.stable, time.time()
+
+    # if the network has gone interval seconds without a change, we assume it is
+    # now stable and raise an event
+    else:
+      if time.time() > self.last_check + self.check_interval:
+        if self.stable is False:
+          self.stable = True
+          self.last_stable, self.last_check = self.stable, time.time()
+          self.raiseEventNoErrors(StableEvent, stable=self.stable)
+
+    if self.debug and self.stable:
+      log.info("----- DEBUG -----")
+      for s in self.switches.items():
+        log.info("switch {0} : ports {1}".format(s[0], s[1].ports))
+      for h in self.hosts.items():
+        log.info("host {0} : has ip {1}".format(h[0], h[1].entry.ipAddrs.keys()))
+      log.info("graph: {0}".format(self.graph))
 
   def _handle_core_ComponentRegistered (self, event):
     '''
@@ -94,7 +127,7 @@ class DynamicTopology (object):
           self.__handle_host_tracker_HostEvent)
       log.info('connected to host_tracker')
 
-  def __handle_host_tracker_HostEvent (self, event):
+  def _handle_host_tracker_HostEvent (self, event):
     '''
     When host_tracker generates HostEvents, then a host has
     joined/left/moved around the network. Use these events to
@@ -108,17 +141,17 @@ class DynamicTopology (object):
     # when hosts leave, remove them from the host dict and graph, then remove
     # them from adjacency list
     if event.leave:
-      if self.hosts.has_key(h):
+      if h in self.hosts:
         del self.hosts[h]
         del self.graph[h]
-        for n in self.graph.keys():
+        for n in self.graph:
           if h in self.graph[n]:
             self.graph[n].remove(h)
 
     # covers join and move cases
     else:
-      if self.hosts.has_key(h):
-        for n in self.graph.keys():
+      if h in self.hosts:
+        for n in self.graph:
           if n != h and h in self.graph[n]:
             self.graph[n].remove(h)
 
@@ -127,7 +160,7 @@ class DynamicTopology (object):
 
       s = dpid_to_str(event.entry.dpid)
       p = event.entry.port
-      assert self.graph.has_key(s)
+      assert s in self.graph
       self.graph[s].add(h)
       self.switches[s].ports[p] = h
       self.graph[h].add(s)
@@ -139,9 +172,10 @@ class DynamicTopology (object):
     '''
 
     s_dpid = dpid_to_str(event.dpid)
-    if not self.switches.has_key(s_dpid):
+    if s_dpid not in self.switches:
       self.switches[s_dpid] = Switch(event.dpid, event.connection)
       self.graph[s_dpid] = set([])
+      self.stable, self.last_check = False, time.time()
 
   def _handle_openflow_ConnectionDown (self, event):
     '''
@@ -149,14 +183,15 @@ class DynamicTopology (object):
     '''
 
     s_dpid = dpid_to_str(event.dpid)
-    if self.switches.has_key(s_dpid):
+    if s_dpid in self.switches:
       # remove switch from graph
       del self.switches[s_dpid]
       del self.graph[s_dpid]
-      for n in self.graph.keys():
+      for n in self.graph:
         if s_dpid in self.graph[n]:
           self.graph[n].remove(s_dpid)
           # this might not work, let's see
+      self.stable, self.last_check = False, time.time()
 
   # this should probably be updated later to be
   # more robust
@@ -169,8 +204,8 @@ class DynamicTopology (object):
     # get the dpids of the switches involved
     s1_id = dpid_to_str(event.link.dpid1)
     s2_id = dpid_to_str(event.link.dpid2)
-    assert s1_id in self.switches.keys()
-    assert s2_id in self.switches.keys()
+    assert s1_id in self.switches
+    assert s2_id in self.switches
 
     # get the switches from these DPIDs
     s1 = self.switches[s1_id]
@@ -187,15 +222,17 @@ class DynamicTopology (object):
 
     # if link DOWN, remove ports from switches and graph
     elif event.removed:
-      if s1.ports.has_key(s1_port):
+      if s1_port in s1.ports:
         del s1.ports[s1_port]
         # if no other connection, remove from adjacency list
-        if s2_id not in s1.ports.values() and self.graph.has_key(s1):
+        if s2_id not in s1.ports.values() and s1 in self.graph:
           self.graph[s1].remove(s2_id)
-      if s2.ports.has_key(s2_port):
+      if s2_port in s2.ports:
         del s2.ports[s2_port]
-        if s1_id not in s2.ports.values() and self.graph.has_key(s2):
+        if s1_id not in s2.ports.values() and s2 in self.graph:
           self.graph[s2].remove(s1_id)
+
+    self.stable, self.last_check = False, time.time()
 
   def get_host_mac_by_ip(self, ip):
     '''

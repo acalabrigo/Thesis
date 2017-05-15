@@ -42,7 +42,7 @@ with open(outfile, 'w') as f:
     # add hosts
     f.write('\n')
     for n in range(0, hosts):
-        f.write("    h{0} = self.addHost('h{0}')\n".format(n))
+        f.write("    h{0} = self.addHost('h{0}', ip=None)\n".format(n))
 
     # add links from center to switches
     f.write('\n')

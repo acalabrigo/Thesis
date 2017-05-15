@@ -5,7 +5,9 @@ from pox.core import core
 from pox.lib.addresses import EthAddr, IPAddr
 from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.ipv4 import ipv4
+from pox.lib.packet.udp import udp
 from pox.lib.packet.arp import arp
+from pox.lib.packet.dhcp import dhcp
 from pox.lib.recoco import Timer
 from pox.lib.revent import Event, EventHalt
 import pox.openflow.libopenflow_01 as of
@@ -52,7 +54,7 @@ class ProactiveFlows (object):
     path = path + [start]
     if start == end:
       return path
-    if not graph.has_key(start):
+    if not start in graph:
       return None
     shortest = None
     for node in graph[start]:
@@ -85,8 +87,13 @@ class ProactiveFlows (object):
     # install flows based on IP.
     if isinstance(packet.next, ipv4):
       ip_packet = packet.next
-      log.info("%i %i IP %s => %s", dpid,event.port,
-          ip_packet.srcip, ip_packet.dstip)
+
+      # ignore DHCP packets
+      net_packet = ip_packet.next
+      if isinstance(net_packet, udp):
+        if (net_packet.srcport == dhcp.CLIENT_PORT and
+            net_packet.dstport == dhcp.SERVER_PORT):
+          return
 
       # retrieve graph info, find shortest path between devices
       log.info("Looking for path from {0} to {1}".format(packet.src, packet.dst))
