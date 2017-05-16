@@ -103,11 +103,18 @@ class DHCPLease (Event):
 
   Call nak() to abort this lease
   """
-  def __init__ (self, host_mac, ip_entry):
+  def __init__ (self, host_mac, ip_entry, port=None,
+                dpid=None, renew=False, expire=False):
     super(DHCPLease, self).__init__()
     self.host_mac = host_mac
     self.ip = ip_entry.ip
+    self.port = port
+    self.dpid = dpid
+    self.renew = renew
+    self.expire = expire
     self._nak = False
+
+    assert sum(1 for x in [renew, expire] if x) == 1
 
   def nak (self):
     self._nak = True
@@ -278,8 +285,7 @@ class SimpleAddressPool (AddressPool):
       c += 1
       if c > self.last: c -= self.count
 
-class DHCPServer (EventMixin):
-  _eventMixin_events = set([DHCPLease])
+class DHCPServer (object):
 
   def __init__ (self, server, ip_address = "192.168.0.254", router_address = (),
                 dns_address = (), pool = None, switches = None, subnet = None,
@@ -423,8 +429,6 @@ class DHCPServer (EventMixin):
     if pool is None:
       return
 
-
-    log.info('packet in {0}'.format(event.dpid))
     if t.type == p.DISCOVER_MSG:
       self.exec_discover(event, p, pool)
     elif t.type == p.REQUEST_MSG:
@@ -443,7 +447,12 @@ class DHCPServer (EventMixin):
         log.info("Entry %s: IP address %s expired",
                  str(client), str(lease.ip) )
         self.pool.append(lease.ip)
+        ev = DHCPLease(client, lease.ip, expire=True)
+        self.server.raiseEvent(ev)
         del self.leases[client]
+        if ev._nak:
+          self.nak(event)
+          return
 
         # if this host was mobile, delete it from mobile host table
         if client in self.server.mobile_hosts:
@@ -518,6 +527,8 @@ class DHCPServer (EventMixin):
     # if client asks for specific IP
     wanted_ip = p.options[p.REQUEST_IP_OPT].addr
     src = event.parsed.src  # src MAC
+    dpid = event.connection.dpid
+    port = event.port
     got_ip = None
     is_mobile = (src in self.server.mobile_hosts)
 
@@ -587,8 +598,8 @@ class DHCPServer (EventMixin):
 
     assert got_ip == wanted_ip
     self.leases[src] = got_ip
-    ev = DHCPLease(src, got_ip)
-    self.raiseEvent(ev)
+    ev = DHCPLease(src, got_ip, port, dpid, renew=True)
+    self.server.raiseEvent(ev)
     if ev._nak:
       self.nak(event)
       return
@@ -659,10 +670,11 @@ class DHCPServer (EventMixin):
     msg.add_option(pkt.DHCP.DHCPIPAddressLeaseTimeOption(self.lease_time))
 
 
-class DHCPD (object):
+class DHCPD (EventMixin):
   '''
   DHCP Server that handles multiple subnets in the network.
   '''
+  _eventMixin_events = set([DHCPLease])
 
   def __init__(self, conf):
       self.conf = conf
@@ -724,10 +736,5 @@ class DHCPD (object):
       except:
         log.info('Input file {0} does not exist'.format(self.conf))
 
-  #def is_in_all_leases(self, src, ignore=None):
-    #for net in self.subnets.itervalues():
-      # if net is not ignore:
-        #if src in
-
 def launch (conf='dhcpd_conf.yaml'):
-  core.registerNew(DHCPD, conf)
+  core.register('dhcpd_multi', DHCPD(conf))

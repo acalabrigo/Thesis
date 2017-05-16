@@ -102,7 +102,7 @@ class ProactiveFlows (object):
       log.info("path found: {0}".format(path))
 
       if path is None:
-          log.info("No path found, waiting on host_tracker")
+          log.info("No path found, waiting on mobile_host_tracker")
           return
       for i in range(1, len(path) - 1):
         device = path[i]

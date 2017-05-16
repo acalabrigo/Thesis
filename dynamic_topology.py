@@ -50,12 +50,8 @@ class Host (object):
     '''
     Retrieve the IP address of this host from the MAC entry.
     '''
+    return self.entry.ipAddr.ip
 
-    ips = self.entry.ipAddrs.keys()
-    if len(ips) > 0:
-      return ips[0]
-    else:
-      return None
 
 class StableEvent (Event):
   '''
@@ -122,12 +118,12 @@ class DynamicTopology (EventMixin):
     We want to listen to HostEvents, this sets that up.
     '''
 
-    if event.name == "host_tracker":
+    if event.name == "mobile_host_tracker":
       event.component.addListenerByName("HostEvent",
-          self.__handle_host_tracker_HostEvent)
-      log.info('connected to host_tracker')
+          self.__handle_mobile_host_tracker_HostEvent)
+      log.info('connected to mobile_host_tracker')
 
-  def _handle_host_tracker_HostEvent (self, event):
+  def _handle_mobile_host_tracker_HostEvent (self, event):
     '''
     When host_tracker generates HostEvents, then a host has
     joined/left/moved around the network. Use these events to
@@ -240,7 +236,7 @@ class DynamicTopology (EventMixin):
     what ARP does.
     '''
 
-    for host in self.hosts.values():
+    for host in self.hosts.itervalues():
       hip = host.get_ip()
       if hip == ip:
           return host.entry.macaddr
@@ -253,5 +249,5 @@ def launch(debug="False"):
     pox.openflow.discovery.launch()
     if not core.hasComponent("dynamic_topology"):
         core.register("dynamic_topology", DynamicTopology(str_to_bool(debug)))
-    import pox.host_tracker
-    pox.host_tracker.launch()
+    import mobile_host_tracker
+    mobile_host_tracker.launch()
