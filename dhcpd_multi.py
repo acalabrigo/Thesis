@@ -362,40 +362,6 @@ class DHCPServer (object):
 
     ipp = event.parsed.find('ipv4')
     if not ipp or not ipp.parsed:
-      if isinstance(event.parsed.next, arp):
-        arpp = event.parsed.next
-        if arpp.prototype == arp.PROTO_TYPE_IP:
-          if arpp.hwtype == arp.HW_TYPE_ETHERNET:
-            if arpp.protosrc != 0:
-              if arpp.opcode == arp.REQUEST:
-                if arpp.protodst != self.ip_addr:
-                  return
-
-                log.info('{0} got packet from {1}'.format(self.ip_addr, event.parsed.src))
-                # create an ARP reply header
-                arpr = arp()
-                arpr.hw_type = arpp.hwtype
-                arpr.prototype = arpp.prototype
-                arpr.hwlen = arpp.hwlen
-                arpr.protolen = arpp.protolen
-                arpr.opcode = arp.REPLY
-                arpr.hwdst = arpp.hwsrc
-                arpr.protodst = arpp.protosrc
-                arpr.protosrc = arpp.protodst
-                arpr.hwsrc = EthAddr(GATEWAY_DUMMY_MAC)
-
-                # create an Ethernet header and encapsulate
-                eth = ethernet(type=event.parsed.type, src=dpid_to_mac(event.dpid),
-                               dst=arpp.hwsrc)
-                eth.set_payload(arpr)
-
-                # send this packet back to the switch
-                msg = of.ofp_packet_out()
-                msg.data = eth.pack()
-                msg.actions.append(of.ofp_action_output(port=of.OFPP_IN_PORT))
-                msg.in_port = event.port
-                event.connection.send(msg)
-                log.info('sending dummy ARP for default gateway on {0}'.format(arpp.hwsrc))
       return
 
     if ipp.dstip not in (IP_ANY,IP_BROADCAST,self.ip_addr):
@@ -680,6 +646,7 @@ class DHCPD (EventMixin):
       self.conf = conf
       self.subnets = {}  # num -> DHCPServer
       self.mobile_hosts = {} # MAC -> IP
+      self.routers = [] # gateway IPs
 
       core.listen_to_dependencies(self, ['dynamic_topology'], short_attrs=True)
 
@@ -730,11 +697,31 @@ class DHCPD (EventMixin):
                                              dns_address=config[subnet]['dns'],
                                              pool=pool,
                                              switches=switches)
+              self.routers.append(IPAddr(config[subnet]['router']))
               log.info('{0} serves subnet {1} on switches {2}'.format(config[subnet]['router'],
                                                                       config[subnet]['net'],
                                                                       switches))
       except:
         log.info('Input file {0} does not exist'.format(self.conf))
+
+  def get_subnet(self, ip_addr):
+    '''
+    Given an IP, return the network address/subnet_mask.
+    '''
+
+    subnet = [self.subnets[s] for s in self.subnets if ip_addr in self.subnets[s].pool.removed]
+    if len(subnet) != 1:
+      raise RuntimeError("{0} is not on a valid subnet in this network".format(ip_addr))
+      return None
+    subnet = subnet[0]
+    network, subnet_mask = subnet.pool.network, subnet.pool.subnet_mask
+    return str(network) + '/' + str(subnet_mask)
+
+  def is_router(self, ip_addr):
+    '''
+    Is this IP one of our router interfaces?
+    '''
+    return ip_addr in self.routers
 
 def launch (conf='dhcpd_conf.yaml'):
   core.register('dhcpd_multi', DHCPD(conf))

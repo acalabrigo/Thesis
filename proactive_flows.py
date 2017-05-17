@@ -21,14 +21,20 @@ log = core.getLogger()
 
 all_ports = of.OFPP_FLOOD
 
+GATEWAY_DUMMY_MAC = '03:00:00:00:be:ef'
+
 def dpid_to_mac (dpid):
     return EthAddr("%012x" % (dpid & 0xffFFffFFffFF,))
 
-class ProactiveFlows (object):
+class ProactiveFlows (object, idle_timeout=60*60):
   def __init__ (self):
     # need to access the graph in dynamic_topology for proactive routes
+    # need access to DHCP to know IP addresses
+    self._priority = 0x8000 + 1
+    self.idle_timeout = idle_timeout
+
     core.openflow.addListeners(self)
-    core.listen_to_dependencies(self, ['dynamic_topology'], short_attrs=True)
+    core.listen_to_dependencies(self, ['dynamic_topology', 'dhcpd_multi'], short_attrs=True)
 
   def _all_dependencies_met (self):
     log.info("proactive_flows ready")
@@ -55,6 +61,7 @@ class ProactiveFlows (object):
     if start == end:
       return path
     if not start in graph:
+      log.info('ended at {0}'.format(start))
       return None
     shortest = None
     for node in graph[start]:
@@ -64,6 +71,49 @@ class ProactiveFlows (object):
           if not shortest or len(newpath) < len(shortest):
             shortest = newpath
     return shortest
+
+  def _edge_reply(self, dst, node1, node2):
+    '''
+    Create a flow mod packet for an edge switch.
+    '''
+
+    msg = of.ofp_flow_mod()
+    msg.match.dl_type = ethernet.IP_TYPE
+    msg.match.nw_dst = dst
+    port = self.dynamic_topology.switches[node1].get_device_port(node2)
+    if port is None:
+      log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
+      return
+    else:
+      msg.actions.append(of.ofp_action_output(port = port))
+    self.dynamic_topology.switches[node1].connection.send(msg)
+
+  def _central_reply(self, dst, node1, node2, mobile=False):
+    '''
+    Create a flow mod packet for a central switch.
+    '''
+    # flow mod for outgoing packets
+    msg = of.ofp_flow_mod()
+    msg.match.dl_type = ethernet.IP_TYPE
+
+    if not mobile:
+      msg.match.nw_dst = self.dhcpd_multi.get_subnet(dst)
+      if msg.match.nw_dst is None:
+        log.warn("Could not find subnet for IP {0}'".format(dst))
+        return
+    else:
+      msg.match.nw_dst = dst
+      msg.priority = self._priority
+      self._priority += 1
+
+    port = self.dynamic_topology.switches[node1].get_device_port(node2)
+    if port is None:
+      log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
+      return
+    else:
+      msg.idle_timeout = self.idle_timeout
+      msg.actions.append(of.ofp_action_output(port = port))
+      self.dynamic_topology.switches[node1].connection.send(msg)
 
   def _handle_PacketIn (self, event):
     '''
@@ -95,10 +145,20 @@ class ProactiveFlows (object):
             net_packet.dstport == dhcp.SERVER_PORT):
           return
 
+      # this is the host sending a packet to its "default gateway" which doesn't
+      # really exist
+      true_dst = packet.dst
+      if packet.dst == EthAddr(GATEWAY_DUMMY_MAC):
+        true_dst = self.dynamic_topology.get_host_mac_by_ip(ip_packet.dstip)
+        if true_dst is None:
+          log.warning('Host with IP {0} is not on this network'.format(ip_packet.dstip))
+          return
+
       # retrieve graph info, find shortest path between devices
-      log.info("Looking for path from {0} to {1}".format(packet.src, packet.dst))
+      log.info("{0} Looking for path from {1} to {2}".format(dpid, packet.src, true_dst))
       graph = self.dynamic_topology.graph.copy()
-      path = self.find_shortest_path(graph, str(packet.src), str(packet.dst))
+
+      path = self.find_shortest_path(graph, str(packet.src), str(true_dst))
       log.info("path found: {0}".format(path))
 
       if path is None:
@@ -109,55 +169,17 @@ class ProactiveFlows (object):
         log.info("adding flows to {0}".format(device))
 
         # if edge node, add flows for MAC
+        #NOTE: checking if switch is at an edge is fine, as long as the assumption
+        #      holds that only edge switches have hosts
         if self.is_edge_node(device) == True:
+          self._edge_reply(ip_packet.dstip, device, path[i + 1])
+          self._edge_reply(ip_packet.srcip, device, path[i - 1])
 
-          # flow mod for outgoing packets
-          msg = of.ofp_flow_mod()
-          msg.match.dl_dst = packet.dst
-          #msg.match.dl_src = packet.src
-          port = self.dynamic_topology.switches[device].get_device_port(path[i + 1])
-          if port is None:
-            log.info("Could not find {0} in {1}'s port table'".format(path[i + 1], device))
-          else:
-            msg.actions.append(of.ofp_action_output(port = port))
-            self.dynamic_topology.switches[device].connection.send(msg)
-
-          # flow mod for return packets
-          msg = of.ofp_flow_mod()
-          msg.match.dl_dst = packet.src
-          #msg.match.dl_src = packet.dst
-          port = self.dynamic_topology.switches[device].get_device_port(path[i - 1])
-          if port is None:
-            log.info("Could not find {0} in {1}'s port table'".format(path[i - 1], device))
-          else:
-            msg.actions.append(of.ofp_action_output(port = port))
-            self.dynamic_topology.switches[device].connection.send(msg)
-
-        else:   # central, so add flows for IP
-
-          # flow mod for outgoing packets
-          msg = of.ofp_flow_mod()
-          msg.match.dl_type = ethernet.IP_TYPE
-          msg.match.nw_dst = ip_packet.dstip
-          #msg.match.nw_src = ip_packet.srcip
-          port = self.dynamic_topology.switches[device].get_device_port(path[i + 1])
-          if port is None:
-            log.info("Could not find {0} in {1}'s port table'".format(path[i + 1], device))
-          else:
-            msg.actions.append(of.ofp_action_output(port = port))
-            self.dynamic_topology.switches[device].connection.send(msg)
-
-          # flow mod for return packets
-          msg = of.ofp_flow_mod()
-          msg.match.dl_type = ethernet.IP_TYPE
-          msg.match.nw_dst = ip_packet.srcip
-          #msg.match.nw_src = ip_packet.dstip
-          port = self.dynamic_topology.switches[device].get_device_port(path[i - 1])
-          if port is None:
-            log.info("Could not find {0} in {1}'s port table'".format(path[i - 1], device))
-          else:
-            msg.actions.append(of.ofp_action_output(port = port))
-            self.dynamic_topology.switches[device].connection.send(msg)
+        else:   # central, so add flows for IP SUBNETS
+          self._central_reply(ip_packet.dstip, device, path[i + 1],
+            mobile=(ip_packet.dstip in self.dhcpd_multi.mobile_hosts.values()))
+          self._central_reply(ip_packet.srcip, device, path[i - 1],
+            mobile=(ip_packet.srcip in self.dhcpd_multi.mobile_hosts.values()))
 
     # CASE: the switch gets an ARP request from a host. In this case,
     # create an ARP reply based on the known network topology. Send this
@@ -185,14 +207,19 @@ class ProactiveFlows (object):
               arp_reply.hwdst = arp_packet.hwsrc
               arp_reply.protodst = arp_packet.protosrc
               arp_reply.protosrc = arp_packet.protodst
-              arp_reply.hwsrc = self.dynamic_topology.get_host_mac_by_ip(
-                arp_packet.protodst)
+
+              if self.dhcpd_multi.is_router(arp_packet.protodst):
+                arp_reply.hwsrc = EthAddr(GATEWAY_DUMMY_MAC)
+              else:
+                arp_reply.hwsrc = self.dynamic_topology.get_host_mac_by_ip(
+                  arp_packet.protodst)
 
               if arp_reply.hwsrc is None:
                 #log.info("Host unknown, broadcasting ARP")
                 #msg = of.ofp_packet_out(data = event.ofp)
                 #msg.actions.append(of.ofp_action_output(port = all_ports))
                 #event.connection.send(msg)
+                log.warn('Host {0} unknown'.format(arp_packet.protodst))
                 return
 
               # create an Ethernet header and encapsulate
@@ -214,6 +241,6 @@ class ProactiveFlows (object):
       # for now, do nothing for this
       return
 
-def launch():
+def launch(idle_timeout=3600):
   if not core.hasComponent("proactive_flows"):
-    core.register("proactive_flows", ProactiveFlows())
+    core.register("proactive_flows", ProactiveFlows(int(idle_timeout)))

@@ -11,6 +11,7 @@ import pox.openflow.discovery as discovery
 import pox.openflow.topology as of_topo
 from pox.lib.revent.revent import *
 from pox.lib.util import dpid_to_str, str_to_bool
+from pox.lib.packet.ethernet import ethernet
 import time
 import pox
 
@@ -76,7 +77,7 @@ class DynamicTopology (EventMixin):
     core.listen_to_dependencies(self)
     self.switches = {} # dpid -> Switch
     self.hosts = {} # mac -> Host
-    self.graph = {}
+    self.graph = {} # ID -> set of IDs
 
     self.debug = debug
 
@@ -107,10 +108,13 @@ class DynamicTopology (EventMixin):
 
     if self.debug and self.stable:
       log.info("----- DEBUG -----")
-      for s in self.switches.items():
+      for s in self.switches.iteritems():
         log.info("switch {0} : ports {1}".format(s[0], s[1].ports))
-      for h in self.hosts.items():
-        log.info("host {0} : has ip {1}".format(h[0], h[1].entry.ipAddrs.keys()))
+      for h in self.hosts.iteritems():
+        if h[1].entry.ipAddr is not None:
+          log.info("host {0} : has ip {1}".format(h[0], h[1].entry.ipAddr.ip))
+        else:
+          log.info("host {0} : no ip yet".format(h[0]))
       log.info("graph: {0}".format(self.graph))
 
   def _handle_core_ComponentRegistered (self, event):
@@ -122,6 +126,14 @@ class DynamicTopology (EventMixin):
       event.component.addListenerByName("HostEvent",
           self.__handle_mobile_host_tracker_HostEvent)
       log.info('connected to mobile_host_tracker')
+
+  def _delete_flow(self, dpid, port, ip):
+    msg = of.ofp_flow_mod()
+    msg.match.dl_type = ethernet.IP_TYPE
+    msg.match.nw_dst = ip
+    msg.actions.append(of.ofp_action_output(port = port))
+    msg.command = of.OFPFC_DELETE
+    self.switches[dpid].connection.send(msg)
 
   def _handle_mobile_host_tracker_HostEvent (self, event):
     '''
@@ -144,17 +156,29 @@ class DynamicTopology (EventMixin):
           if h in self.graph[n]:
             self.graph[n].remove(h)
 
-    # covers join and move cases
-    else:
+    elif event.move:
+      self._delete_flow(s, event.entry.port, event.entry.ipAddr.ip)
       if h in self.hosts:
         for n in self.graph:
           if n != h and h in self.graph[n]:
+            switch = self.switches[n]
+            del switch.ports[switch.get_device_port(h)]
             self.graph[n].remove(h)
 
       self.hosts[h] = Host(event.entry.macaddr, event.entry)
       self.graph[h] = set([])
 
-      s = dpid_to_str(event.entry.dpid)
+      s = dpid_to_str(event.new_dpid)
+      p = event.new_port
+      assert s in self.graph
+      self.graph[s].add(h)
+      self.switches[s].ports[p] = h
+      self.graph[h].add(s)
+
+    else: # join
+      self.hosts[h] = Host(event.entry.macaddr, event.entry)
+      self.graph[h] = set([])
+
       p = event.entry.port
       assert s in self.graph
       self.graph[s].add(h)

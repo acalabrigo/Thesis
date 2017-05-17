@@ -265,7 +265,7 @@ class mobile_host_tracker (EventMixin):
     msg = of.ofp_packet_out(data = e.pack(),
                             action = of.ofp_action_output(port=macEntry.port))
     if core.openflow.sendToDPID(macEntry.dpid, msg.pack()):
-      ipEntry = macEntry.ipAddrs[ipAddr]
+      ipEntry = macEntry.ipAddr
       ipEntry.pings.sent()
     else:
       # macEntry is stale, remove it.
