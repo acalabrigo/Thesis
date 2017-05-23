@@ -1,0 +1,27 @@
+subnet1:
+  switches: [5]
+  net: "192.168.1.0/24"
+  router: "192.168.1.254"
+  dns: "8.8.8.0"
+  range:
+
+subnet2:
+  switches: [6]
+  net: "192.168.2.0/24"
+  router: "192.168.2.254"
+  dns: "8.8.8.0"
+  range:
+
+subnet3:
+  switches: [7]
+  net: "192.168.3.0/24"
+  router: "192.168.3.254"
+  dns: "8.8.8.0"
+  range:
+
+subnet4:
+  switches: [8]
+  net: "192.168.4.0/24"
+  router: "192.168.4.254"
+  dns: "8.8.8.0"
+  range:
