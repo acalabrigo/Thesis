@@ -164,7 +164,7 @@ def run():
         info('*** h1 dhclient\n')
         h1.cmd('dhclient ' + h1.defaultIntf().name)
         info( '*** Testing connectivity:\n' )
-        CLI(net, script='mt1_s1')
+        CLI(net, script='mt2_s1')
         old = new
     net.stop()
 
