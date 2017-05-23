@@ -533,29 +533,29 @@ class DHCPServer (object):
 
     # check for mobile host
     if got_ip is None:
-     mobile_ip = self.server.mobile_hosts.get(src)
-     # mobile host already discovered, renew lease from original server
-     if mobile_ip is not None and mobile_ip == wanted_ip:
-       log.info('{0} recognized mobile host {1}'.format(self.ip_addr, src))
-       subnet = [s for s in self.server.subnets.itervalues() if src in s.leases]
-       if subnet is None:
-         raise RuntimeError("%s designated mobile but not found on server" % (src,))
-         return
-       if len(subnet) > 1:
-         raise RuntimeError("%s found on multiple servers" % (src,))
-         return
-       subnet = subnet[0]
-       subnet.exec_request(event, p, subnet.pool)
-       return
+      mobile_ip = self.server.mobile_hosts.get(src)
+      # mobile host already discovered, renew lease from original server
+      if mobile_ip is not None and mobile_ip == wanted_ip:
+        log.info('{0} recognized mobile host {1}'.format(self.ip_addr, src))
+        subnet = [s for s in self.server.subnets.itervalues() if src in s.leases]
+        if subnet is None:
+          raise RuntimeError("%s designated mobile but not found on server" % (src,))
+          return
+        if len(subnet) > 1:
+          raise RuntimeError("%s found on multiple servers" % (src,))
+          return
+        subnet = subnet[0]
+        subnet.exec_request(event, p, subnet.pool)
+        return
 
-     else: # new mobile host found
-       for subnet in [s for s in self.server.subnets.itervalues() if s != self]:
-         mobile_ip = subnet.leases.get(src)
-         if mobile_ip is not None and mobile_ip.ip == wanted_ip:
-           log.info("%s is now mobile with IP %s", src, wanted_ip)
-           self.server.mobile_hosts[src] = wanted_ip
-           subnet.exec_request(event, p, subnet.pool)
-           return
+      else: # new mobile host found
+        for subnet in [s for s in self.server.subnets.itervalues() if s != self]:
+          mobile_ip = subnet.leases.get(src)
+          if mobile_ip is not None and mobile_ip.ip == wanted_ip:
+            log.info("%s is now mobile with IP %s", src, wanted_ip)
+            self.server.mobile_hosts[src] = wanted_ip
+            subnet.exec_request(event, p, subnet.pool)
+            return
 
     if got_ip is None:
       log.warn("%s asked for un-offered %s", src, wanted_ip)

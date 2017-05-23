@@ -24,7 +24,29 @@ all_ports = of.OFPP_FLOOD
 GATEWAY_DUMMY_MAC = '03:00:00:00:be:ef'
 
 def dpid_to_mac (dpid):
-    return EthAddr("%012x" % (dpid & 0xffFFffFFffFF,))
+  return EthAddr("%012x" % (dpid & 0xffFFffFFffFF,))
+
+def on_subnet (ip, net):
+  '''
+  Given an IP and a network, tell me if the IP belongs natively to
+  that network.
+  '''
+
+  # parse the network
+  network, netmask = net.split('/')
+  network, netmask = IPAddr(network), int(netmask)
+
+  # calculate the IP if the host were on the network
+  raw_ip = ip.toUnsigned()
+  mask = (1 << 32 - netmask) - 1
+  ip_on_subnet = (raw_ip & mask) | network.toUnsigned()
+
+  # see if the addresses are the same
+  if ip_on_subnet != raw_ip:
+    return False
+  else:
+    return True
+
 
 class ProactiveFlows (object):
   def __init__ (self, idle_timeout=300):
@@ -108,9 +130,10 @@ class ProactiveFlows (object):
     # flow mod for outgoing packets
     msg = of.ofp_flow_mod()
     msg.match.dl_type = ethernet.IP_TYPE
+    subnet = self.dhcpd_multi.get_subnet(dst)
 
-    if not mobile:
-      msg.match.nw_dst = self.dhcpd_multi.get_subnet(dst)
+    if not mobile or (mobile and on_subnet(dst, subnet)):
+      msg.match.nw_dst = subnet
       if msg.match.nw_dst is None:
         log.warn("Could not find subnet for IP {0}'".format(dst))
         return
