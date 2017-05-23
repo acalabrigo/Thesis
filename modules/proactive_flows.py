@@ -26,13 +26,9 @@ GATEWAY_DUMMY_MAC = '03:00:00:00:be:ef'
 def dpid_to_mac (dpid):
     return EthAddr("%012x" % (dpid & 0xffFFffFFffFF,))
 
-class ProactiveFlows (object, idle_timeout=60*60):
-  def __init__ (self):
-    # need to access the graph in dynamic_topology for proactive routes
-    # need access to DHCP to know IP addresses
-    self._priority = 0x8000 + 1
+class ProactiveFlows (object):
+  def __init__ (self, idle_timeout=300):
     self.idle_timeout = idle_timeout
-
     core.openflow.addListeners(self)
     core.listen_to_dependencies(self, ['dynamic_topology', 'dhcpd_multi'], short_attrs=True)
 
@@ -88,6 +84,23 @@ class ProactiveFlows (object, idle_timeout=60*60):
       msg.actions.append(of.ofp_action_output(port = port))
     self.dynamic_topology.switches[node1].connection.send(msg)
 
+    def _edge_reply_local(self, dst, node1, node2):
+      '''
+      Create a flow mod packet for an edge switch for l2 traffic within the
+      subnet.
+      '''
+
+      msg = of.ofp_flow_mod()
+      msg.match.dl_dst = dst
+      port = self.dynamic_topology.switches[node1].get_device_port(node2)
+      if port is None:
+        log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
+        return
+      else:
+        msg.actions.append(of.ofp_action_output(port = port))
+      self.dynamic_topology.switches[node1].connection.send(msg)
+      log.debug("Installing local L2 flow %s <-> %s" % (packet.src, packet.dst))
+
   def _central_reply(self, dst, node1, node2, mobile=False):
     '''
     Create a flow mod packet for a central switch.
@@ -103,8 +116,6 @@ class ProactiveFlows (object, idle_timeout=60*60):
         return
     else:
       msg.match.nw_dst = dst
-      msg.priority = self._priority
-      self._priority += 1
 
     port = self.dynamic_topology.switches[node1].get_device_port(node2)
     if port is None:
@@ -131,7 +142,7 @@ class ProactiveFlows (object, idle_timeout=60*60):
     if packet.type == ethernet.LLDP_TYPE: # Ignore LLDP packets
       return
 
-    # CASE: ipv4 traffic into the switch. In this case, create a flow table
+    # CASE 1: ipv4 traffic into the switch. In this case, create a flow table
     # entry in each switch along the shortest path. If a switch is an edge
     # switch, install flows based on MAC. If ta switch is centralized,
     # install flows based on IP.
@@ -171,7 +182,7 @@ class ProactiveFlows (object, idle_timeout=60*60):
         # if edge node, add flows for MAC
         #NOTE: checking if switch is at an edge is fine, as long as the assumption
         #      holds that only edge switches have hosts
-        if self.is_edge_node(device) == True:
+        if self.dhcpd_multi.is_central(device) == False:
           self._edge_reply(ip_packet.dstip, device, path[i + 1])
           self._edge_reply(ip_packet.srcip, device, path[i - 1])
 
@@ -181,7 +192,7 @@ class ProactiveFlows (object, idle_timeout=60*60):
           self._central_reply(ip_packet.srcip, device, path[i - 1],
             mobile=(ip_packet.srcip in self.dhcpd_multi.mobile_hosts.values()))
 
-    # CASE: the switch gets an ARP request from a host. In this case,
+    # CASE 2: the switch gets an ARP request from a host. In this case,
     # create an ARP reply based on the known network topology. Send this
     # back out the input port on the switch.
     elif isinstance(packet.next, arp):
@@ -237,10 +248,37 @@ class ProactiveFlows (object, idle_timeout=60*60):
               log.info("%i %i answering ARP for %s" % (dpid, event.port,
                   str(arp_reply.protosrc)))
               return
+
+    # CASE 3: here we look to see if we have an L2 protocol localized on a
+    # single subnet. In this case, we install L2 flows on this subnet
     else:
-      # for now, do nothing for this
+      dst = packet.dst
+      src = packet.src
+      if dst == EthAddr(GATEWAY_DUMMY_MAC):
+        log.warn('Packet of type {0} not supported yet'.format(type(packet.next)))
+        return
+
+      if str(dst) in self.dynamic_topology.hosts:
+        log.info("{0} Looking for path from {1} to {2}".format(dpid, src, dst))
+        graph = self.dynamic_topology.graph.copy()
+        path = self.find_shortest_path(graph, str(src), str(dst))
+        log.info("path found: {0}".format(path))
+
+        if path is None:
+            log.info("No path found, waiting on mobile_host_tracker")
+            return
+
+        if not self.dhcpd_multi.is_local_path(path):
+          log.warn('Ignoring non-local path {0} -> {1}'.format(str(src), str(dst)))
+          return
+
+        for i in range(1, len(path) - 1):
+          device = path[i]
+          self._edge_reply_local(dst, device, path[i + 1])
+          self._edge_reply_local(src, device, path[i - 1])
+
       return
 
-def launch(idle_timeout=3600):
+def launch(idle_timeout=300):
   if not core.hasComponent("proactive_flows"):
     core.register("proactive_flows", ProactiveFlows(int(idle_timeout)))

@@ -127,13 +127,25 @@ class DynamicTopology (EventMixin):
           self.__handle_mobile_host_tracker_HostEvent)
       log.info('connected to mobile_host_tracker')
 
-  def _delete_flow(self, dpid, port, ip):
-    msg = of.ofp_flow_mod()
-    msg.match.dl_type = ethernet.IP_TYPE
-    msg.match.nw_dst = ip
-    msg.actions.append(of.ofp_action_output(port = port))
-    msg.command = of.OFPFC_DELETE
-    self.switches[dpid].connection.send(msg)
+  def _delete_flows(self, ip):
+    mac = self.get_host_mac_by_ip(ip)
+    if mac is None:
+      log.warn('trying to delete flows for IP not in use: {0}'.format(ip))
+      return
+
+    # remove this host from our flow tables
+    for s in self.switches:
+      msg = of.ofp_flow_mod()
+      msg.match.dl_type = ethernet.IP_TYPE
+      msg.match.nw_dst = ip
+      msg.command = of.OFPFC_DELETE
+      self.switches[s].connection.send(msg)
+
+      msg = of.ofp_flow_mod()
+      msg.match.dl_dst = mac
+      msg.command = of.OFPFC_DELETE
+      self.switches[s].connection.send(msg)
+
 
   def _handle_mobile_host_tracker_HostEvent (self, event):
     '''
@@ -157,7 +169,7 @@ class DynamicTopology (EventMixin):
             self.graph[n].remove(h)
 
     elif event.move:
-      self._delete_flow(s, event.entry.port, event.entry.ipAddr.ip)
+      self._delete_flows(event.entry.ipAddr.ip)
       if h in self.hosts:
         for n in self.graph:
           if n != h and h in self.graph[n]:
@@ -267,11 +279,5 @@ class DynamicTopology (EventMixin):
     return None
 
 def launch(debug="False"):
-    import pox.topology
-    pox.topology.launch()
-    import pox.openflow.discovery
-    pox.openflow.discovery.launch()
     if not core.hasComponent("dynamic_topology"):
         core.register("dynamic_topology", DynamicTopology(str_to_bool(debug)))
-    import mobile_host_tracker
-    mobile_host_tracker.launch()

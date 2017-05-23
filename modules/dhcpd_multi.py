@@ -647,6 +647,7 @@ class DHCPD (EventMixin):
       self.subnets = {}  # num -> DHCPServer
       self.mobile_hosts = {} # MAC -> IP
       self.routers = [] # gateway IPs
+      self.central_switches = []
 
       core.listen_to_dependencies(self, ['dynamic_topology'], short_attrs=True)
 
@@ -661,7 +662,9 @@ class DHCPD (EventMixin):
             log.info("Couldn't load server configuration")
             return
 
-          log.info('Loading DHCP server configuration...')
+          log.info('Loading DHCP server configuration from {0}...'.format(self.conf))
+
+          seen_switches = []
 
           # look through subnets
           for subnet in config:
@@ -688,6 +691,8 @@ class DHCPD (EventMixin):
                   last = int(config[subnet]['range'][1])
 
               switches = config[subnet]['switches']
+              seen_switches += [dpid_to_str(s) for s in switches]
+
               pool = SimpleAddressPool(network = config[subnet]['net'],
                                        first = first,
                                        last = last)
@@ -701,8 +706,10 @@ class DHCPD (EventMixin):
               log.info('{0} serves subnet {1} on switches {2}'.format(config[subnet]['router'],
                                                                       config[subnet]['net'],
                                                                       switches))
+              self.central_switches = [s for s in self.dynamic_topology.switches
+                                       if s not in seen_switches]
       except:
-        log.info('Input file {0} does not exist'.format(self.conf))
+        log.info('Error loading {0}'.format(self.conf))
 
   def get_subnet(self, ip_addr):
     '''
@@ -723,5 +730,20 @@ class DHCPD (EventMixin):
     '''
     return ip_addr in self.routers
 
+  def is_central(self, dpid):
+    '''
+    Does this DPID identify a central switch in our network?
+    '''
+    return (str(dpid) in self.central_switches)
+
+  def is_local_path(self, path):
+    '''
+    Is this traffic localized to one subnet?
+    '''
+    central_switches = [node for node in path[1:-1] if node in self.central_switches]
+    return central_switches == []
+
+
 def launch (conf='dhcpd_conf.yaml'):
+  log.info('Config: {0}'.format(conf))
   core.register('dhcpd_multi', DHCPD(conf))

@@ -67,7 +67,7 @@ timeoutSec = dict(
   arpAware=60*2,   # Quiet ARP-responding entries are pinged after this
   arpSilent=60*20, # This is for uiet entries not known to answer ARP
   arpReply=4,      # Time to wait for an ARP reply before retrial
-  timerInterval=5, # Seconds between timer routine activations
+  timerInterval=300, # Seconds between timer routine activations
   entryMove=60     # Minimum expected time to move a physical entry
   )
 
