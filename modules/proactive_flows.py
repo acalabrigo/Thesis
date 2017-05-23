@@ -34,12 +34,12 @@ def on_subnet (ip, net):
 
   # parse the network
   network, netmask = net.split('/')
-  network, netmask = IPAddr(network), int(netmask)
+  network, netmask = IPAddr(network).toUnsigned(), IPAddr(netmask).toUnsigned()
 
   # calculate the IP if the host were on the network
   raw_ip = ip.toUnsigned()
-  mask = (1 << 32 - netmask) - 1
-  ip_on_subnet = (raw_ip & mask) | network.toUnsigned()
+  mask = ~netmask
+  ip_on_subnet = (raw_ip & mask) | network
 
   # see if the addresses are the same
   if ip_on_subnet != raw_ip:
