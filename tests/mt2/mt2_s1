@@ -1,0 +1,7 @@
+h1 ping -c 2 h2
+h2 ping -c 2 h1
+pingall
+sh ovs-ofctl dump-flows s5
+sh ovs-ofctl dump-flows s1
+sh ovs-ofctl dump-flows s2
+sh ovs-ofctl dump-flows s6
