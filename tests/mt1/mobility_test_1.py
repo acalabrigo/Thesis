@@ -141,7 +141,6 @@ def run():
     net.start()
     info('*** Network:\n')
     printConnections(net.switches)
-    info('*** Waiting for DHCP Server to connect...\n')
     time.sleep(15)
 
     h1, h2, old = net.get('h1', 'h2', 's5')
@@ -153,7 +152,7 @@ def run():
     CLI(net, script='mt1_s1')
 
 
-    for s in 6, 5:
+    for s in [6, ]:
         new = net[ 's%d' % s ]
         port = randint( 10, 20 )
         info( '* Moving', h1, 'from', old, 'to', new, 'port', port, '\n' )
