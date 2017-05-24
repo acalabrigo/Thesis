@@ -150,7 +150,7 @@ def run():
         info('*** {0} dhclient\n'.format(h.name))
         info(h.cmd('dhclient ' + h.defaultIntf().name))
 
-    CLI(net, script='mt1_s1')
+    CLI(net, script='mt2_s1')
 
 
     for s in 6, 5:
