@@ -144,28 +144,47 @@ def run():
     info('*** Waiting for DHCP Server to connect...\n')
     time.sleep(15)
 
-    h1, h2, old = net.get('h1', 'h2', 's5')
+    h1, h2, old1, old2 = net.get('h1', 'h2', 's5', 's6')
 
     for h in [h1, h2]:
         info('*** {0} dhclient\n'.format(h.name))
         info(h.cmd('dhclient ' + h.defaultIntf().name))
 
-    CLI(net, script='mt1_s1')
+    CLI(net, script='mt3_s1')
 
+    n = 1
+    i = 0
+    while i < n:
+        s = 7
+        new1 = net['s%d' % s]
+        port1 = randint(10, 20)
+        info('* Moving', h1, 'from', old1, 'to', new1, 'port', port1, '\n')
+        hintf, sintf = moveHost(h1, old1, new1, newPort=port1)
+        info('*', hintf, 'is now connected to', sintf, '\n')
 
-    for s in 6, 5:
-        new = net[ 's%d' % s ]
-        port = randint( 10, 20 )
-        info( '* Moving', h1, 'from', old, 'to', new, 'port', port, '\n' )
-        hintf, sintf = moveHost( h1, old, new, newPort=port )
-        info( '*', hintf, 'is now connected to', sintf, '\n' )
-        info( '* New network:\n' )
-        printConnections( net.switches )
+        time.sleep(1)
+
+        s = 8
+        new2 = net['s%d' % s]
+        port2 = randint(10, 20)
+        info('* Moving', h2, 'from', old2, 'to', new2, 'port', port2, '\n')
+        hintf, sintf = moveHost(h2, old2, new2, newPort=port2)
+        info('*', hintf, 'is now connected to', sintf, '\n')
+
+        time.sleep(1)
+
+        info('* New network:\n')
+        printConnections(net.switches)
         info('*** h1 dhclient\n')
         h1.cmd('dhclient ' + h1.defaultIntf().name)
+        info('*** h2 dhclient\n')
+        h1.cmd('dhclient ' + h2.defaultIntf().name)
         info( '*** Testing connectivity:\n' )
-        CLI(net, script='mt2_s1')
-        old = new
+        CLI(net, script='mt3_s1')
+        
+        old1 = new1
+        old2 = new2
+        i += 1
     net.stop()
 
 if __name__ == '__main__':
