@@ -64,7 +64,7 @@ log = core.getLogger()
 
 # Times (in seconds) to use for differente timouts:
 timeoutSec = dict(
-  arpAware=60*2,   # Quiet ARP-responding entries are pinged after this
+  arpAware=60*5,   # Quiet ARP-responding entries are pinged after this
   arpSilent=60*20, # This is for quiet entries not known to answer ARP
   arpReply=4,      # Time to wait for an ARP reply before retrial
   timerInterval=5, # Seconds between timer routine activations
@@ -462,7 +462,7 @@ class mobile_host_tracker (EventMixin):
         ip_addr, ipEntry = macEntry.ipAddr.ip, macEntry.ipAddr
         if ipEntry.expired():
           if ipEntry.pings.failed():
-            del macEntry.ipAddr
+            macEntry.ipAddr = None
             log.info("Entry %s: IP address %s expired",
                      str(macEntry), str(ip_addr) )
           else:

@@ -162,6 +162,7 @@ class DynamicTopology (EventMixin):
     # them from adjacency list
     if event.leave:
       if h in self.hosts:
+        #self._delete_flows(event.entry.ipAddr.ip)
         del self.hosts[h]
         del self.graph[h]
         for n in self.graph:
@@ -169,8 +170,8 @@ class DynamicTopology (EventMixin):
             self.graph[n].remove(h)
 
     elif event.move:
-      self._delete_flows(event.entry.ipAddr.ip)
       if h in self.hosts:
+        self._delete_flows(event.entry.ipAddr.ip)
         for n in self.graph:
           if n != h and h in self.graph[n]:
             switch = self.switches[n]

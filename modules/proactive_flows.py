@@ -156,7 +156,7 @@ class ProactiveFlows (object):
     entries to install in which switches based on the received packet
     and the network topology.
     '''
-
+    
     packet = event.parsed
     dpid = event.connection.dpid
 

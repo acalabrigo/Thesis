@@ -413,7 +413,7 @@ class DHCPServer (object):
         log.info("Entry %s: IP address %s expired",
                  str(client), str(lease.ip) )
         self.pool.append(lease.ip)
-        ev = DHCPLease(client, lease.ip, expire=True)
+        ev = DHCPLease(client, lease, expire=True)
         self.server.raiseEvent(ev)
         del self.leases[client]
         if ev._nak:
@@ -696,6 +696,10 @@ class DHCPD (EventMixin):
               pool = SimpleAddressPool(network = config[subnet]['net'],
                                        first = first,
                                        last = last)
+              static_hosts = config[subnet].get('static')
+              if static_hosts is not None:
+                  for sh in static_hosts:
+                      pool.remove(IPAddr(sh))
               self.subnets[num] = DHCPServer(server=self,
                                              ip_address=config[subnet]['router'],
                                              router_address=(),
@@ -706,6 +710,9 @@ class DHCPD (EventMixin):
               log.info('{0} serves subnet {1} on switches {2}'.format(config[subnet]['router'],
                                                                       config[subnet]['net'],
                                                                       switches))
+              if static_hosts is not None:
+                  log.info('static hosts {0} on subnet {1}'.format(static_hosts,
+                                                                   config[subnet]['net']))
               self.central_switches = [s for s in self.dynamic_topology.switches
                                        if s not in seen_switches]
       except:
