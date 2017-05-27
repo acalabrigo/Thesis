@@ -731,6 +731,19 @@ class DHCPD (EventMixin):
     network, subnet_mask = subnet.pool.network, subnet.pool.subnet_mask
     return str(network) + '/' + str(subnet_mask)
 
+  def get_switch_subnet(self, dpid):
+    '''
+    Given a switch, return the network address/subnet_mask it's on.
+    '''
+
+    subnet = [self.subnets[s] for s in self.subnets if dpid in self.subnets[s].switches]
+    if len(subnet) != 1:
+      raise RuntimeError("{0} is not on a valid subnet in this network".format(dpid_str))
+      return None
+    subnet = subnet[0]
+    network, subnet_mask = subnet.pool.network, subnet.pool.subnet_mask
+    return str(network) + '/' + str(subnet_mask)
+
   def is_router(self, ip_addr):
     '''
     Is this IP one of our router interfaces?

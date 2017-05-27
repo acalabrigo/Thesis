@@ -16,7 +16,7 @@ import time
 from math import log
 import thread
 
-NUM_SWITCHES = 14
+NUM_SWITCHES = 16
 NUM_CORE = 2
 NUM_HOSTS = 2
 FANOUT = 2
@@ -155,22 +155,25 @@ class WalkTopo(Topo):
                     mesh[switches[i]].add(j)
 
         edge_switches = switches[num_core:]
-        height = int(log(edge_per_core + 1, fanout))
-
+        height = int(log(edge_per_core, fanout))
+        print(height)
         # add edge switches, 1 Gbps links
         offset = 0
         for i in range(0, num_core):
-            nodes = [switches[i]]
+            self.addLink(switches[i], edge_switches[offset],
+                         bw=1000, delay='1ms', loss=0)
+            nodes = [edge_switches[offset]]
+            offset += 1
             added = 0
             while nodes != []:
                 for j in range(0, fanout):
-                    if added < edge_per_core:
+                    if added < edge_per_core - 1:
                         self.addLink(nodes[0], edge_switches[offset + j],
                                      bw=1000, delay='1ms', loss=0)
                         nodes.append(edge_switches[offset + j])
                         added += 1
                 offset += fanout
-                if added >= edge_per_core:
+                if added >= edge_per_core - 1:
                     break
                 nodes.remove(nodes[0])
 
@@ -181,8 +184,8 @@ class WalkTopo(Topo):
         h1 = self.addHost('h1',ip=None)  # mobile host
         h2 = self.addHost('h2', ip='10.151.120.254/24') # static host
 
-        self.addLink(h1, switches[4], bw=1000, delay='1ms', loss=0)
-        self.addLink(h2, switches[13], bw=1000, delay='1ms', loss=0)
+        self.addLink(h1, switches[5], bw=1000, delay='1ms', loss=0)
+        self.addLink(h2, switches[15], bw=1000, delay='1ms', loss=0)
 
 def run():
     topo = WalkTopo()

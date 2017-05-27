@@ -103,6 +103,7 @@ class ProactiveFlows (object):
       log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
       return
     else:
+      msg.idle_timeout = self.idle_timeout
       msg.actions.append(of.ofp_action_output(port = port))
     self.dynamic_topology.switches[node1].connection.send(msg)
 
@@ -119,6 +120,7 @@ class ProactiveFlows (object):
         log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
         return
       else:
+        msg.idle_timeout = self.idle_timeout
         msg.actions.append(of.ofp_action_output(port = port))
       self.dynamic_topology.switches[node1].connection.send(msg)
       log.debug("Installing local L2 flow %s <-> %s" % (packet.src, packet.dst))
@@ -130,8 +132,10 @@ class ProactiveFlows (object):
     # flow mod for outgoing packets
     msg = of.ofp_flow_mod()
     msg.match.dl_type = ethernet.IP_TYPE
-    subnet = self.dhcpd_multi.get_subnet(dst)
+    switch = self.dynamic_topology.get_host_ap(dst)
+    subnet = self.dhcpd_multi.get_switch_subnet(switch)
 
+    log.info('flow for {0} on subnet {1} on_subnet? {2} is_mobile? {3}'.format(dst, subnet, on_subnet(dst, subnet), mobile))
     if not mobile or (mobile and on_subnet(dst, subnet)):
       msg.match.nw_dst = subnet
       if msg.match.nw_dst is None:
@@ -139,6 +143,7 @@ class ProactiveFlows (object):
         return
     else:
       msg.match.nw_dst = dst
+      msg.priority = 0x8000 + 50
 
     port = self.dynamic_topology.switches[node1].get_device_port(node2)
     if port is None:
@@ -156,7 +161,7 @@ class ProactiveFlows (object):
     entries to install in which switches based on the received packet
     and the network topology.
     '''
-    
+
     packet = event.parsed
     dpid = event.connection.dpid
 

@@ -279,6 +279,20 @@ class DynamicTopology (EventMixin):
           return host.entry.macaddr
     return None
 
+  def get_host_ap(self, ip):
+    '''
+    For the given host ip, return the switch dpid it is currently
+    connected to.
+    '''
+
+    mac = str(self.get_host_mac_by_ip(ip))
+    if mac is None:
+      return None
+    dpid = self.hosts[mac].entry.dpid
+    if dpid is None:
+      return None
+    return dpid
+
 def launch(debug="False"):
     if not core.hasComponent("dynamic_topology"):
         core.register("dynamic_topology", DynamicTopology(str_to_bool(debug)))
