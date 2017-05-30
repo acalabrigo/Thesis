@@ -53,7 +53,6 @@ class Host (object):
     '''
     return self.entry.ipAddr.ip
 
-
 class StableEvent (Event):
   '''
   Event when the topology has not experienced any changes in a
@@ -77,10 +76,13 @@ class DynamicTopology (EventMixin):
     core.listen_to_dependencies(self)
     self.switches = {} # dpid -> Switch
     self.hosts = {} # mac -> Host
+    self.mobile_hosts = {} # mac -> IP
     self.graph = {} # ID -> set of IDs
 
     self.debug = debug
 
+    self.got_link = False
+    self.waiting_links = []
     self.stable = False
     self.last_stable = self.stable
     self.last_check = time.time()
@@ -91,6 +93,17 @@ class DynamicTopology (EventMixin):
     '''
     See if our network has undergone changes.
     '''
+
+    # don't raise events if we haven't seen any links yet
+    if self.got_link is False:
+      self.stable = self.last_stable
+      self.last_check = time.time()
+      return
+
+    # see if we have links waiting for switches
+    while self.waiting_links != []:
+      for link in self.waiting_links[:]:
+        core.openflow_discovery.raiseEvent(link)
 
     # if the network status has changed, raise event
     if self.stable != self.last_stable:
@@ -107,15 +120,15 @@ class DynamicTopology (EventMixin):
           self.raiseEventNoErrors(StableEvent, stable=self.stable)
 
     if self.debug and self.stable:
-      log.info("----- DEBUG -----")
+      log.debug("----- DEBUG -----")
       for s in self.switches.iteritems():
-        log.info("switch {0} : ports {1}".format(s[0], s[1].ports))
+        log.debug("switch {0} : ports {1}".format(s[0], s[1].ports))
       for h in self.hosts.iteritems():
         if h[1].entry.ipAddr is not None:
-          log.info("host {0} : has ip {1}".format(h[0], h[1].entry.ipAddr.ip))
+          log.debug("host {0} : has ip {1}".format(h[0], h[1].entry.ipAddr.ip))
         else:
-          log.info("host {0} : no ip yet".format(h[0]))
-      log.info("graph: {0}".format(self.graph))
+          log.debug("host {0} : no ip yet".format(h[0]))
+      log.debug("graph: {0}".format(self.graph))
 
   def _handle_core_ComponentRegistered (self, event):
     '''
@@ -146,7 +159,6 @@ class DynamicTopology (EventMixin):
       msg.command = of.OFPFC_DELETE
       self.switches[s].connection.send(msg)
 
-
   def _handle_mobile_host_tracker_HostEvent (self, event):
     '''
     When host_tracker generates HostEvents, then a host has
@@ -157,46 +169,49 @@ class DynamicTopology (EventMixin):
     # Name is intentionally mangled to keep listen_to_dependencies away
     h = str(event.entry.macaddr)
     s = dpid_to_str(event.entry.dpid)
+    is_mobile = event.is_mobile
 
     # when hosts leave, remove them from the host dict and graph, then remove
     # them from adjacency list
     if event.leave:
       if h in self.hosts:
-        #self._delete_flows(event.entry.ipAddr.ip)
+        if event.old_ip:
+          self._delete_flows(old_ip)
+        if is_mobile:
+          del self.mobile_hosts[h]
         del self.hosts[h]
         del self.graph[h]
         for n in self.graph:
           if h in self.graph[n]:
             self.graph[n].remove(h)
 
-    elif event.move:
-      if h in self.hosts:
-        self._delete_flows(event.entry.ipAddr.ip)
-        for n in self.graph:
-          if n != h and h in self.graph[n]:
-            switch = self.switches[n]
-            del switch.ports[switch.get_device_port(h)]
-            self.graph[n].remove(h)
+    else:
+      if event.move: # move
+        if h in self.hosts:
+          if h in self.mobile_hosts and is_mobile is False:
+            del self.mobile_hosts[h]
+          self._delete_flows(event.entry.ipAddr.ip)
+          for n in self.graph:
+            if n != h and h in self.graph[n]:
+              switch = self.switches[n]
+              del switch.ports[switch.get_device_port(h)]
+              self.graph[n].remove(h)
+
+        s = dpid_to_str(event.new_dpid)
+        p = event.new_port
+
+      else: # join
+        p = event.entry.port
 
       self.hosts[h] = Host(event.entry.macaddr, event.entry)
       self.graph[h] = set([])
 
-      s = dpid_to_str(event.new_dpid)
-      p = event.new_port
       assert s in self.graph
       self.graph[s].add(h)
       self.switches[s].ports[p] = h
       self.graph[h].add(s)
-
-    else: # join
-      self.hosts[h] = Host(event.entry.macaddr, event.entry)
-      self.graph[h] = set([])
-
-      p = event.entry.port
-      assert s in self.graph
-      self.graph[s].add(h)
-      self.switches[s].ports[p] = h
-      self.graph[h].add(s)
+      if is_mobile:
+        self.mobile_hosts[h] = event.entry.ipAddr.ip
 
   def _handle_openflow_ConnectionUp (self, event):
     '''
@@ -234,9 +249,17 @@ class DynamicTopology (EventMixin):
     to update our graph.
     '''
 
+    self.got_link = True
+
     # get the dpids of the switches involved
     s1_id = dpid_to_str(event.link.dpid1)
     s2_id = dpid_to_str(event.link.dpid2)
+
+    if s1_id not in self.switches or s2_id not in self.switches:
+      if event not in self.waiting_links:
+        self.waiting_links.append(event)
+      return
+
     assert s1_id in self.switches
     assert s2_id in self.switches
 
@@ -264,6 +287,9 @@ class DynamicTopology (EventMixin):
         del s2.ports[s2_port]
         if s1_id not in s2.ports.values() and s2 in self.graph:
           self.graph[s2].remove(s1_id)
+
+    if event in self.waiting_links:
+      self.waiting_links.remove(event)
 
     self.stable, self.last_check = False, time.time()
 

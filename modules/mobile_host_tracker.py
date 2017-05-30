@@ -42,7 +42,7 @@ You can also specify how many ARP pings we try before deciding it failed:
 
 from pox.core import core
 
-from pox.lib.addresses import EthAddr
+from pox.lib.addresses import EthAddr, IPAddr
 from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.ipv4 import ipv4
 from pox.lib.packet.arp import arp
@@ -75,18 +75,40 @@ timeoutSec = dict(
 # The particular one here is just an arbitrary locally administered address.
 DEFAULT_ARP_PING_SRC_MAC = '02:00:00:00:be:ef'
 
+def on_subnet (ip, net):
+  '''
+  Given an IP and a network, tell me if the IP belongs natively to
+  that network.
+  '''
+
+  # parse the network
+  network, netmask = net.split('/')
+  network, netmask = IPAddr(network).toUnsigned(), IPAddr(netmask).toUnsigned()
+
+  # calculate the IP if the host were on the network
+  raw_ip = ip.toUnsigned()
+  mask = ~netmask
+  ip_on_subnet = (raw_ip & mask) | network
+
+  # see if the addresses are the same
+  if ip_on_subnet != raw_ip:
+    return False
+  else:
+    return True
 
 class HostEvent (Event):
   """
   Event when hosts join, leave, or move within the network
   """
-  def __init__ (self, entry, new_dpid = None, new_port = None, join = False,
-      leave = False, move = False):
+  def __init__ (self, entry, old_ip = None, new_dpid = None, new_port = None, join = False,
+      leave = False, move = False, is_mobile = False):
     super(HostEvent,self).__init__()
     self.entry = entry
+    self.old_ip = old_ip
     self.join = join
     self.leave = leave
     self.move = move
+    self.is_mobile = is_mobile
 
     assert sum(1 for x in [join,leave,move] if x) == 1
 
@@ -179,12 +201,11 @@ class MacEntry (Alive):
   services, and it may replace dpid by a general switch object reference
   We use the port to determine which port to forward traffic out of.
   """
-  def __init__ (self, dpid, port, macaddr, is_mobile=False):
+  def __init__ (self, dpid, port, macaddr):
     super(MacEntry,self).__init__()
     self.dpid = dpid
     self.port = port
     self.macaddr = macaddr
-    self.is_mobile = is_mobile
     self.ipAddr = None
 
   def __str__(self):
@@ -318,7 +339,7 @@ class mobile_host_tracker (EventMixin):
       # new mapping
       ipEntry = IpEntry(hasARP, pckt_srcip)
       macEntry.ipAddr = ipEntry
-      log.info("Learned %s got IP %s", str(macEntry), str(pckt_srcip))
+      log.debug("Learned %s got IP %s", str(macEntry), str(pckt_srcip))
     if hasARP:
       ipEntry.pings.received()
 
@@ -326,11 +347,12 @@ class mobile_host_tracker (EventMixin):
     '''
     We want to listen to DHCPLease events, this sets that up.
     '''
-    core.dhcpd_multi.addListenerByName("DHCPLease", self._handle_lease)
-    log.info('listening for lease events')
 
-  def _handle_lease (self, event):
-    log.info('lease event heard')
+    core.listen_to_dependencies(self, ['dhcpd_multi'], short_attrs=True)
+    #core.dhcpd_multi.addListenerByName("DHCPLease", self._handle_lease)
+    log.info('listening to dhcpd_multi')
+
+  def _handle_dhcpd_multi_DHCPLease (self, event):
     # Learn or update dpid/port/MAC info
     macEntry = self.getMacEntry(event.host_mac)
 
@@ -339,37 +361,44 @@ class mobile_host_tracker (EventMixin):
       if macEntry is None:
         # there is no known host by that MAC
         # should we raise a NewHostFound event (at the end)?
-        macEntry = MacEntry(event.dpid, event.port, event.host_mac, is_mobile=True)
+        macEntry = MacEntry(event.dpid, event.port, event.host_mac)
         self.entryByMAC[event.host_mac] = macEntry
-        log.info("Learned %s through DHCP", str(macEntry))
+
+        (pckt_srcip, hasARP) = event.ip, False
+        if pckt_srcip is not None:
+          self.updateIPInfo(pckt_srcip,macEntry,hasARP)
+
+        log.debug("Learned %s through DHCP", str(macEntry))
         self.raiseEventNoErrors(HostEvent, macEntry, join=True)
       elif macEntry != (event.dpid, event.port, event.host_mac):
         # there is already an entry of host with that MAC, but host has moved
         # should we raise a HostMoved event (at the end)?
-        log.info("Learned %s moved to %i %i through DHCP", str(macEntry), event.dpid, event.port)
+        log.debug("Learned %s moved to %i %i through DHCP", str(macEntry), event.dpid, event.port)
         # if there has not been long since heard from it...
         if time.time() - macEntry.lastTimeSeen < timeoutSec['entryMove']:
           log.warning("Possible duplicate: %s at time %i, now (%i %i), time %i",
                       str(macEntry), macEntry.lastTimeSeen,
                       event.dpid, event.port, time.time())
+
+        (pckt_srcip, hasARP) = event.ip, False
+        if pckt_srcip is not None:
+          self.updateIPInfo(pckt_srcip,macEntry,hasARP)
+
         # should we create a whole new entry, or keep the previous host info?
         # for now, we keep it: IP info, answers pings, etc.
-        e = HostEvent(macEntry, move=True, new_dpid = event.dpid, new_port = event.port)
+        e = HostEvent(macEntry, move=True, new_dpid = event.dpid, new_port = event.port,
+                      is_mobile=event.is_mobile)
         self.raiseEventNoErrors(e)
         macEntry.dpid = e._new_dpid
         macEntry.port = e._new_port
 
       macEntry.refresh()
 
-      (pckt_srcip, hasARP) = event.ip, False
-      if pckt_srcip is not None:
-        self.updateIPInfo(pckt_srcip,macEntry,hasARP)
-
     # if this lease has expired, remove IP address from entry
     else:
       if macEntry is not None:
         macEntry.ipAddr = None
-        log.info("Learned %s IP lease expired", str(macEntry))
+        log.debug("Learned %s IP lease expired", str(macEntry))
 
   def _handle_openflow_ConnectionUp (self, event):
     if not self.install_flow: return
@@ -395,8 +424,11 @@ class mobile_host_tracker (EventMixin):
     removing the info from antoher entry previously with that IP address).
     It does not forward any packets, just extract info from them.
     """
+
     dpid = event.connection.dpid
     inport = event.port
+    subnet = self.dhcpd_multi.get_switch_subnet(dpid) # get the subnet of this switch
+
     packet = event.parsed
     if not packet.parsed:
       log.warning("%i %i ignoring unparsed packet", dpid, inport)
@@ -425,29 +457,41 @@ class mobile_host_tracker (EventMixin):
       # should we raise a NewHostFound event (at the end)?
       macEntry = MacEntry(dpid,inport,packet.src)
       self.entryByMAC[packet.src] = macEntry
-      log.info("Learned %s", str(macEntry))
-      self.raiseEventNoErrors(HostEvent, macEntry, join=True)
+
+      (pckt_srcip, hasARP) = self.getSrcIPandARP(packet.next)
+      if pckt_srcip is not None and pckt_srcip != '0.0.0.0':
+        self.updateIPInfo(pckt_srcip,macEntry,hasARP)
+
+      log.debug("Learned %s", str(macEntry))
+      e = HostEvent(macEntry, join=True)
+      self.raiseEventNoErrors(e)
     elif macEntry != (dpid, inport, packet.src):
       # there is already an entry of host with that MAC, but host has moved
       # should we raise a HostMoved event (at the end)?
-      log.info("Learned %s moved to %i %i", str(macEntry), dpid, inport)
+      log.debug("Learned %s moved to %i %i", str(macEntry), dpid, inport)
       # if there has not been long since heard from it...
       if time.time() - macEntry.lastTimeSeen < timeoutSec['entryMove']:
         log.warning("Possible duplicate: %s at time %i, now (%i %i), time %i",
                     str(macEntry), macEntry.lastTimeSeen,
                     dpid, inport, time.time())
+
+      (pckt_srcip, hasARP) = self.getSrcIPandARP(packet.next)
+      if pckt_srcip is not None and pckt_srcip != '0.0.0.0':
+        self.updateIPInfo(pckt_srcip,macEntry,hasARP)
+
+      is_mobile = False
+      if macEntry.ipAddr is not None:
+        is_mobile = (not on_subnet(macEntry.ipAddr.ip, subnet))
+
       # should we create a whole new entry, or keep the previous host info?
       # for now, we keep it: IP info, answers pings, etc.
-      e = HostEvent(macEntry, move=True, new_dpid = dpid, new_port = inport)
+      e = HostEvent(macEntry, move=True, new_dpid = dpid, new_port = inport,
+                    is_mobile=is_mobile)
       self.raiseEventNoErrors(e)
       macEntry.dpid = e._new_dpid
       macEntry.port = e._new_port
 
     macEntry.refresh()
-
-    (pckt_srcip, hasARP) = self.getSrcIPandARP(packet.next)
-    if pckt_srcip is not None and pckt_srcip != '0.0.0.0':
-      self.updateIPInfo(pckt_srcip,macEntry,hasARP)
 
     if self.eat_packets and packet.dst == self.ping_src_mac:
       return EventHalt
@@ -463,20 +507,20 @@ class mobile_host_tracker (EventMixin):
         if ipEntry.expired():
           if ipEntry.pings.failed():
             macEntry.ipAddr = None
-            log.info("Entry %s: IP address %s expired",
+            log.debug("Entry %s: IP address %s expired",
                      str(macEntry), str(ip_addr) )
           else:
             self.sendPing(macEntry,ip_addr)
             ipEntry.pings.sent()
             entryPinged = True
       if macEntry.expired() and not entryPinged:
-        log.info("Entry %s expired", str(macEntry))
+        log.debug("Entry %s expired", str(macEntry))
         # sanity check: there should be no IP address left
         if macEntry.ipAddr is not None:
           log.warning("Entry %s expired but still had IP address %s",
                       str(macEntry), str(ip_addr) )
           macEntry.ipAddr = None
-        self.raiseEventNoErrors(HostEvent, macEntry, leave=True)
+        self.raiseEventNoErrors(HostEvent, macEntry, old_ip=ip_addr, leave=True)
         del self.entryByMAC[macEntry.macaddr]
 
 

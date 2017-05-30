@@ -104,7 +104,7 @@ class DHCPLease (Event):
   Call nak() to abort this lease
   """
   def __init__ (self, host_mac, ip_entry, port=None,
-                dpid=None, renew=False, expire=False):
+                dpid=None, renew=False, expire=False, is_mobile=False):
     super(DHCPLease, self).__init__()
     self.host_mac = host_mac
     self.ip = ip_entry.ip
@@ -112,6 +112,7 @@ class DHCPLease (Event):
     self.dpid = dpid
     self.renew = renew
     self.expire = expire
+    self.is_mobile = is_mobile
     self._nak = False
 
     assert sum(1 for x in [renew, expire] if x) == 1
@@ -359,7 +360,6 @@ class DHCPServer (object):
   # checks the packet, processes DHCP msg from client
   def _handle_PacketIn (self, event):
     # Is it to us?  (Or at least not specifically NOT to us...)
-
     ipp = event.parsed.find('ipv4')
     if not ipp or not ipp.parsed:
       return
@@ -401,6 +401,7 @@ class DHCPServer (object):
       self.exec_request(event, p, pool)
     elif t.type == p.RELEASE_MSG:
       self.exec_release(event, p, pool)
+    return EventHalt
 
   def _check_leases (self):
     """
@@ -410,7 +411,7 @@ class DHCPServer (object):
     for client in self.leases.keys():
       lease = self.leases[client]
       if lease.expired():
-        log.info("Entry %s: IP address %s expired",
+        log.debug("Entry %s: IP address %s expired",
                  str(client), str(lease.ip) )
         self.pool.append(lease.ip)
         ev = DHCPLease(client, lease, expire=True)
@@ -421,8 +422,8 @@ class DHCPServer (object):
           return
 
         # if this host was mobile, delete it from mobile host table
-        if client in self.server.mobile_hosts:
-          del self.server.mobile_hosts[client]
+        #if client in self.server.mobile_hosts:
+          #del self.server.mobile_hosts[client]
 
   def reply (self, event, msg):
     # this seems to encapsulate our DHCP packets in the proper headers
@@ -478,10 +479,10 @@ class DHCPServer (object):
     del self.leases[p.chaddr]
     pool.append(p.ciaddr)
 
-    if src in self.server.mobile_hosts:
-      del self.server.mobile_hosts[src]
+    if src in self.server.dynamic_topology.mobile_hosts:
+      del self.server.dynamic_topology.mobile_hosts[src]
 
-    log.info("%s released %s" % (src,p.ciaddr))
+    log.debug("%s released %s" % (src,p.ciaddr))
 
   def exec_request (self, event, p, pool):
     # create and send ACKNOWLEDGE in response to REQUEST
@@ -496,7 +497,7 @@ class DHCPServer (object):
     dpid = event.connection.dpid
     port = event.port
     got_ip = None
-    is_mobile = (src in self.server.mobile_hosts)
+    is_mobile = (src in self.server.dynamic_topology.mobile_hosts)
 
     # renew
     if src in self.leases:
@@ -504,7 +505,7 @@ class DHCPServer (object):
         # if the host is mobile but is not asking for a different address,
         # we want to consider it no longer mobile
         if is_mobile:
-          del self.server.mobile_hosts[src]
+          del self.server.dynamic_topology.mobile_hosts[src]
         pool.append(self.leases[src].ip)
         del self.leases[src]
       else:
@@ -529,14 +530,14 @@ class DHCPServer (object):
         # an address on this server... we should no longer consider it mobile
         # NOTE: we let the lease expire on its current server for convenience
         if is_mobile:
-          del self.server.mobile_hosts[src]
+          del self.server.dynamic_topology.mobile_hosts[src]
 
     # check for mobile host
     if got_ip is None:
-      mobile_ip = self.server.mobile_hosts.get(src)
+      mobile_ip = self.server.dynamic_topology.mobile_hosts.get(src)
       # mobile host already discovered, renew lease from original server
       if mobile_ip is not None and mobile_ip == wanted_ip:
-        log.info('{0} recognized mobile host {1}'.format(self.ip_addr, src))
+        log.debug('{0} recognized mobile host {1}'.format(self.ip_addr, src))
         subnet = [s for s in self.server.subnets.itervalues() if src in s.leases]
         if subnet is None:
           raise RuntimeError("%s designated mobile but not found on server" % (src,))
@@ -552,8 +553,8 @@ class DHCPServer (object):
         for subnet in [s for s in self.server.subnets.itervalues() if s != self]:
           mobile_ip = subnet.leases.get(src)
           if mobile_ip is not None and mobile_ip.ip == wanted_ip:
-            log.info("%s is now mobile with IP %s", src, wanted_ip)
-            self.server.mobile_hosts[src] = wanted_ip
+            log.debug("%s is now mobile with IP %s", src, wanted_ip)
+            self.server.dynamic_topology.mobile_hosts[src] = wanted_ip
             subnet.exec_request(event, p, subnet.pool)
             return
 
@@ -564,12 +565,12 @@ class DHCPServer (object):
 
     assert got_ip == wanted_ip
     self.leases[src] = got_ip
-    ev = DHCPLease(src, got_ip, port, dpid, renew=True)
+    ev = DHCPLease(src, got_ip, port, dpid, renew=True, is_mobile=is_mobile)
     self.server.raiseEvent(ev)
     if ev._nak:
       self.nak(event)
       return
-    log.info("%s leased %s to %s" % (self.ip_addr, got_ip, src))
+    log.debug("%s leased %s to %s" % (self.ip_addr, got_ip, src))
 
     # create ack reply
     reply = pkt.dhcp()
@@ -635,7 +636,6 @@ class DHCPServer (object):
       msg.add_option(pkt.DHCP.DHCPDNSServersOption(self.dns_addr))
     msg.add_option(pkt.DHCP.DHCPIPAddressLeaseTimeOption(self.lease_time))
 
-
 class DHCPD (EventMixin):
   '''
   DHCP Server that handles multiple subnets in the network.
@@ -645,7 +645,7 @@ class DHCPD (EventMixin):
   def __init__(self, conf):
       self.conf = conf
       self.subnets = {}  # num -> DHCPServer
-      self.mobile_hosts = {} # MAC -> IP
+      #self.mobile_hosts = {} # MAC -> IP
       self.routers = [] # gateway IPs
       self.central_switches = []
 
@@ -659,10 +659,10 @@ class DHCPD (EventMixin):
         with open(self.conf, 'r') as f:
           config = yaml.load(f)
           if config is None:
-            log.info("Couldn't load server configuration")
+            log.debug("Couldn't load server configuration")
             return
 
-          log.info('Loading DHCP server configuration from {0}...'.format(self.conf))
+          log.debug('Loading DHCP server configuration from {0}...'.format(self.conf))
 
           seen_switches = []
 
@@ -716,7 +716,7 @@ class DHCPD (EventMixin):
               self.central_switches = [s for s in self.dynamic_topology.switches
                                        if s not in seen_switches]
       except:
-        log.info('Error loading {0}'.format(self.conf))
+        log.debug('Error loading {0}'.format(self.conf))
 
   def get_subnet(self, ip_addr):
     '''
@@ -763,7 +763,6 @@ class DHCPD (EventMixin):
     central_switches = [node for node in path[1:-1] if node in self.central_switches]
     return central_switches == []
 
-
 def launch (conf='dhcpd_conf.yaml'):
-  log.info('Config: {0}'.format(conf))
+  log.debug('Config: {0}'.format(conf))
   core.register('dhcpd_multi', DHCPD(conf))
