@@ -3,55 +3,131 @@
 #
 # 2017 Adam Calabrigo
 
+# POX
 from pox.core import core
 from pox.lib.recoco import Timer
 from pox.lib.revent import Event, EventHalt
 import pox.openflow.libopenflow_01 as of
+import pox.lib.packet as pkt
+from pox.lib.packet.arp import arp
+from pox.lib.packet.ethernet import ethernet
+from pox.lib.addresses import IPAddr,EthAddr,parse_cidr
+from pox.lib.addresses import IP_BROADCAST, IP_ANY
 import pox.openflow.discovery as discovery
 import pox.openflow.topology as of_topo
 from pox.lib.revent.revent import *
 from pox.lib.util import dpid_to_str, str_to_bool
 from pox.lib.packet.ethernet import ethernet
-import time
+from pox.lib.addresses import EthAddr, IPAddr
 import pox
+
+import time
+
+# networkX
+import networkx as nx
+from networkx.algorithms.clique import find_cliques
+from networkx.algorithms.shortest_paths.generic import shortest_path
 
 log = core.getLogger()
 
-class Switch (object):
-  '''
-  Simple switch object for our topology.
-  '''
+# from host_tracker.py
+class Alive (object):
+  """
+  Holds liveliness information for MAC and IP entries.
+  """
 
-  def __init__ (self, dpid, connection):
-      self.dpid = dpid
-      self.connection = connection
-      self.ports = {} # port num -> entity
+  def __init__ (self, livelinessInterval=timeoutSec['arpAware']):
+    self.lastTimeSeen = time.time()
+    self.interval = livelinessInterval
 
-  def get_device_port (self, device):
-    '''
-    Get the port to which the target device is connected.
-    '''
+  def expired (self):
+    return time.time() > self.lastTimeSeen + self.interval
 
-    port_device = self.ports.items()
-    port = [p for p,d in port_device if d == device]
-    if len(port) > 0:
-      return port[0]
+  def refresh (self):
+    self.lastTimeSeen = time.time()
+
+
+class PingCtrl (Alive):
+  """
+  Holds information for handling ARP pings for hosts.
+  """
+
+  # Number of ARP ping attemps before deciding it failed
+  pingLim=3
+
+  def __init__ (self):
+    super(PingCtrl,self).__init__(timeoutSec['arpReply'])
+    self.pending = 0
+
+  def sent (self):
+    self.refresh()
+    self.pending += 1
+
+  def failed (self):
+    return self.pending > PingCtrl.pingLim
+
+  def received (self):
+    # Clear any pending timeouts related to ARP pings
+    self.pending = 0
+
+
+# new and modified code starts here
+class IPAddress (Alive):
+  """
+  This keeps track of IP addresses seen from each MAC entry and will
+  be kept in the host object's ipaddrs dictionary. At least for now,
+  there is no need to refer to the original host as the code is organized.
+  """
+
+  def __init__ (self, hasARP, ip):
+    if hasARP:
+      super(IPAddress,self).__init__(timeoutSec['arpAware'])
     else:
-      return None
+      super(IPAddress,self).__init__(timeoutSec['arpSilent'])
+    self.hasARP = hasARP
+    self.pings = PingCtrl()
+    self.ip = ip
 
-class Host (object):
-  '''
-  Simple host object for our topology.
-  '''
-  def __init__ (self, mac, entry):
-    self.mac = mac
-    self.entry = entry
+  def setHasARP (self):
+    if not self.hasARP:
+      self.hasARP = True
+      self.interval = timeoutSec['arpAware']
 
-  def get_ip(self):
-    '''
-    Retrieve the IP address of this host from the MAC entry.
-    '''
-    return self.entry.ipAddr.ip
+
+class Host (Alive):
+  """
+  Not strictly an ARP entry.
+  When it gets moved to Topology, may include other host info, like
+  services, and it may replace dpid by a general switch object reference
+  We use the port to determine which port to forward traffic out of.
+  """
+
+  def __init__ (self, dpid, port, macaddr):
+    super(Host,self).__init__()
+    self.dpid = dpid
+    self.port = port
+    self.macaddr = macaddr
+    self.ipaddr = None
+
+  def __str__(self):
+    return ' '.join([str(self.dpid), str(self.port), str(self.macaddr)])
+
+  def __eq__ (self, other):
+    if other is None:
+      return False
+    elif type(other) == tuple:
+      return (self.dpid,self.port,self.macaddr)==other
+
+    if self.dpid != other.dpid: return False
+    if self.port != other.port: return False
+    if self.macaddr != other.macaddr: return False
+    if self.dpid != other.dpid: return False
+    # What about ipaddrs??
+    return True
+
+  def __ne__ (self, other):
+    return not self.__eq__(other)
+
 
 class StableEvent (Event):
   '''
@@ -59,9 +135,21 @@ class StableEvent (Event):
   predetermined interval of time.
   '''
 
-  def __init__(self, stable):
+  def __init__(self, stable, graph):
     super(StableEvent, self).__init__();
     self.stable = stable
+    self.graph = graph
+
+
+class DHCPEvent (Event):
+  '''
+  Event when the topology receives a DHCP packet.
+  '''
+
+  def __init__(self, graph):
+    super(DHCPEvent, self).__init__();
+    self.graph = graph
+
 
 class DynamicTopology (EventMixin):
   '''
@@ -70,28 +158,53 @@ class DynamicTopology (EventMixin):
   and the host_tracker module to track host locations and MAC/IPs.
   '''
 
-  _eventMixin_events = set([StableEvent])
+  _eventMixin_events = set([StableEvent, DHCPEvent])
 
-  def __init__ (self, debug=False, check_interval=5.0):
-    core.listen_to_dependencies(self)
-    self.switches = {} # dpid -> Switch
-    self.hosts = {} # mac -> Host
-    self.mobile_hosts = {} # mac -> IP
-    self.graph = {} # ID -> set of IDs
+  def __init__ (self, debug = False, check_interval = 5.0, eat_packets = True):
+    # the graph of the network
+    self.graph = nx.Graph()
 
+    # send pings from dummy address to check liveliness
+    if ping_src_mac is None:
+      ping_src_mac = DEFAULT_ARP_PING_SRC_MAC
+    self.ping_src_mac = EthAddr(ping_src_mac)
+
+    # eat packets before other modules see them?
+    self.eat_packets = eat_packets
+    listen_args = {}
+    if eat_packets:
+      listen_args={'openflow':{'priority':1}}
+    core.listen_to_dependencies(self, listen_args=listen_args)
+
+    # debug printouts
     self.debug = debug
 
+    # cache links
     self.got_link = False
     self.waiting_links = []
+
+    # stability information
     self.stable = False
     self.last_stable = self.stable
+
+    # timer to check liveliness and stability
     self.last_check = time.time()
     self.check_interval = check_interval
-    self._t = Timer(self.check_interval, self._check_stability, recurring=True)
+    self._t = Timer(self.check_interval, self._run_checks, recurring=True)
+
+  # Timer functions
+  def _run_checks (self):
+    '''
+    At every interval, check the stability of the network (switches)
+    and the status of hosts on the network.
+    '''
+
+    self._check_stability()
+    self._check_host_timeouts()
 
   def _check_stability (self):
     '''
-    See if our network has undergone changes.
+    Checks for network topology changes.
     '''
 
     # don't raise events if we haven't seen any links yet
@@ -107,7 +220,7 @@ class DynamicTopology (EventMixin):
 
     # if the network status has changed, raise event
     if self.stable != self.last_stable:
-      self.raiseEventNoErrors(StableEvent, stable=self.stable)
+      self.raiseEventNoErrors(StableEvent, stable = self.stable, graph = self.graph)
       self.last_stable, self.last_check = self.stable, time.time()
 
     # if the network has gone interval seconds without a change, we assume it is
@@ -117,132 +230,88 @@ class DynamicTopology (EventMixin):
         if self.stable is False:
           self.stable = True
           self.last_stable, self.last_check = self.stable, time.time()
-          self.raiseEventNoErrors(StableEvent, stable=self.stable)
+          self.raiseEventNoErrors(StableEvent, stable = self.stable, graph = self.graph)
 
-    if self.debug and self.stable:
+    # extra debug settings -- not recommended as makes output difficult to read
+    '''if self.debug and self.stable:
       log.debug("----- DEBUG -----")
       for s in self.switches.iteritems():
         log.debug("switch {0} : ports {1}".format(s[0], s[1].ports))
       for h in self.hosts.iteritems():
-        if h[1].entry.ipAddr is not None:
-          log.debug("host {0} : has ip {1}".format(h[0], h[1].entry.ipAddr.ip))
+        if h[1].entry.ipaddr is not None:
+          log.debug("host {0} : has ip {1}".format(h[0], h[1].entry.ipaddr.ip))
         else:
           log.debug("host {0} : no ip yet".format(h[0]))
-      log.debug("graph: {0}".format(self.graph))
+      log.debug("graph: {0}".format(self.graph))'''
 
-  def _handle_core_ComponentRegistered (self, event):
-    '''
-    We want to listen to HostEvents, this sets that up.
-    '''
+  def _check_host_timeouts (self):
+    """
+    Checks for timed out hosts
+    """
 
-    if event.name == "mobile_host_tracker":
-      event.component.addListenerByName("HostEvent",
-          self.__handle_mobile_host_tracker_HostEvent)
-      log.info('connected to mobile_host_tracker')
+    for host in [node for node in self.graph.nodes(data=True)
+                 if 'info' in node[1]:
+      # host[0] is the MAC and host[1] is the dict of attributes
+      entry_pinged = False
+      host = host[1]['info']
+      if host_info.ipaddr is not None:
+        ip_addr, ip_address = host.ipaddr.ip, host.ipaddr
+        if ip_address.expired():
+          if ip_address.pings.failed():
+              ip_addr = str(ip_addr)
+            ip_address = None
+            log.debug("Host %s: IP address %s expired",
+                      str(host), ip_addr)
+          else:
+            self.sendPing(host, ip_addr)
+            ipEntry.pings.sent()
+            entry_pinged = True
+      else:
+        ip_addr = None
+      if host.expired() and not entry_pinged:
+        log.debug("Entry %s expired", str(host))
+        # sanity check: there should be no IP address left
+        if host.ipaddr is not None:
+          log.warning("Entry %s expired but still had IP address %s",
+                      str(host), str(ip_addr) )
+          host.ipaddr = None
+        self.raiseEventNoErrors(HostEvent, host, old_ip=ip_addr,
+                                old_mac=host.macaddr, leave=True)
+        self.update_host(host, leave=True)
 
-  def _delete_flows(self, ip):
-    mac = self.get_host_mac_by_ip(ip)
-    if mac is None:
-      log.warn('trying to delete flows for IP not in use: {0}'.format(ip))
-      return
-
-    # remove this host from our flow tables
-    for s in self.switches:
-      msg = of.ofp_flow_mod()
-      msg.match.dl_type = ethernet.IP_TYPE
-      msg.match.nw_dst = ip
-      msg.command = of.OFPFC_DELETE
-      self.switches[s].connection.send(msg)
-
-      msg = of.ofp_flow_mod()
-      msg.match.dl_dst = mac
-      msg.command = of.OFPFC_DELETE
-      self.switches[s].connection.send(msg)
-
-  def _handle_mobile_host_tracker_HostEvent (self, event):
-    '''
-    When host_tracker generates HostEvents, then a host has
-    joined/left/moved around the network. Use these events to
-    add hosts to the graph.
-    '''
-
-    # Name is intentionally mangled to keep listen_to_dependencies away
-    h = str(event.entry.macaddr)
-    s = dpid_to_str(event.entry.dpid)
-    is_mobile = event.is_mobile
-
-    # when hosts leave, remove them from the host dict and graph, then remove
-    # them from adjacency list
-    if event.leave:
-      if h in self.hosts:
-        if event.old_ip:
-          self._delete_flows(old_ip)
-        if is_mobile:
-          del self.mobile_hosts[h]
-        del self.hosts[h]
-        del self.graph[h]
-        for n in self.graph:
-          if h in self.graph[n]:
-            self.graph[n].remove(h)
-
-    else:
-      if event.move: # move
-        if h in self.hosts:
-          if h in self.mobile_hosts and is_mobile is False:
-            del self.mobile_hosts[h]
-          self._delete_flows(event.entry.ipAddr.ip)
-          for n in self.graph:
-            if n != h and h in self.graph[n]:
-              switch = self.switches[n]
-              del switch.ports[switch.get_device_port(h)]
-              self.graph[n].remove(h)
-
-        s = dpid_to_str(event.new_dpid)
-        p = event.new_port
-
-      else: # join
-        p = event.entry.port
-
-      self.hosts[h] = Host(event.entry.macaddr, event.entry)
-      self.graph[h] = set([])
-
-      assert s in self.graph
-      self.graph[s].add(h)
-      self.switches[s].ports[p] = h
-      self.graph[h].add(s)
-      if is_mobile:
-        self.mobile_hosts[h] = event.entry.ipAddr.ip
-
+  # Switch management
   def _handle_openflow_ConnectionUp (self, event):
     '''
     When switches join the network, create switch objects
-    and add to the graph.
+    and add to the graph. Also add flow table entries so that
+    this module sees ARP responses first.
     '''
 
-    s_dpid = dpid_to_str(event.dpid)
-    if s_dpid not in self.switches:
-      self.switches[s_dpid] = Switch(event.dpid, event.connection)
-      self.graph[s_dpid] = set([])
+    dpid = event.dpid
+    if dpid not in self.graph:
+      self.graph.add_node(dpid, connection=event.connection)
       self.stable, self.last_check = False, time.time()
+
+    log.debug("Installing flow for ARP ping responses")
+
+    m = of.ofp_flow_mod()
+    m.priority += 1 # Higher than normal
+    m.match.dl_type = ethernet.ARP_TYPE
+    m.match.dl_dst = self.ping_src_mac
+
+    m.actions.append(of.ofp_action_output(port=of.OFPP_CONTROLLER))
+    event.connection.send(m)
 
   def _handle_openflow_ConnectionDown (self, event):
     '''
     When switches leave, remove them from the graph.
     '''
 
-    s_dpid = dpid_to_str(event.dpid)
-    if s_dpid in self.switches:
-      # remove switch from graph
-      del self.switches[s_dpid]
-      del self.graph[s_dpid]
-      for n in self.graph:
-        if s_dpid in self.graph[n]:
-          self.graph[n].remove(s_dpid)
-          # this might not work, let's see
+    dpid = event.dpid
+    if dpid in self.graph.nodes():
+      self.graph.remove_node(dpid)
       self.stable, self.last_check = False, time.time()
 
-  # this should probably be updated later to be
-  # more robust
   def _handle_openflow_discovery_LinkEvent (self, event):
     '''
     When discovery generates link events, use the link info
@@ -251,74 +320,326 @@ class DynamicTopology (EventMixin):
 
     self.got_link = True
 
-    # get the dpids of the switches involved
-    s1_id = dpid_to_str(event.link.dpid1)
-    s2_id = dpid_to_str(event.link.dpid2)
+    # NOTE: new code
+    s1 = event.link.dpid1
+    s2 = event.link.dpid2
 
-    if s1_id not in self.switches or s2_id not in self.switches:
+    if s1 not in self.graph.nodes() or s2 not in self.graph.nodes():
       if event not in self.waiting_links:
         self.waiting_links.append(event)
       return
 
-    assert s1_id in self.switches
-    assert s2_id in self.switches
-
-    # get the switches from these DPIDs
-    s1 = self.switches[s1_id]
-    s2 = self.switches[s2_id]
-    s1_port = event.link.port1
-    s2_port = event.link.port2
-
-    # if link UP, add ports to switches and graph
     if event.added:
-      s1.ports[s1_port] = s2_id
-      s2.ports[s2_port] = s1_id
-      self.graph[s1_id].add(s2_id)
-      self.graph[s2_id].add(s1_id)
-
-    # if link DOWN, remove ports from switches and graph
+      self.graph.add_edge(s1, s2, link=event.link)
     elif event.removed:
-      if s1_port in s1.ports:
-        del s1.ports[s1_port]
-        # if no other connection, remove from adjacency list
-        if s2_id not in s1.ports.values() and s1 in self.graph:
-          self.graph[s1].remove(s2_id)
-      if s2_port in s2.ports:
-        del s2.ports[s2_port]
-        if s1_id not in s2.ports.values() and s2 in self.graph:
-          self.graph[s2].remove(s1_id)
+      self.graph.remove_edge(s1, s2)
 
     if event in self.waiting_links:
       self.waiting_links.remove(event)
 
     self.stable, self.last_check = False, time.time()
 
-  def get_host_mac_by_ip(self, ip):
+  def is_edge_port(self, dpid, inport):
+    '''
+    Returns true if the given port on the given switch is not connected to
+    another switch.
+    '''
+
+    # Look at the link between the switch and neighbors. If the
+    # the given inport is found connected to another switch, then
+    # this is not an edge port. Otherwise, it is.
+    for node in self.graph.neighbors(dpid):
+      edge_info = self.graph[dpid][node]
+      if 'link' in edge_info:
+        link = edge_info['link']
+        if (link.dpid1 == dpid and link.port1 == inport) or
+          (link.dpid2 == dpid and link.port2 == inport):
+          return False
+    return True
+
+  def get_link_port (self, src_dpid, dst_dpid):
+    '''
+    If a link exists from src_dpid to dst_dpid, return the port
+    on src_dpid.
+    '''
+
+    assert dst_dpid in self.graph.neighbors(src_dpid)
+    link = self.graph[src_dpid][dst_dpid]['link']
+
+    if src_dpid == link.dpid1:
+      return link.port1
+    else:
+      return link.port2
+  
+  # Host management
+  def delete_host_flows (self, ip, mac):
+
+    assert ip is not None and mac is not None
+    # remove this host from our flow tables
+    switches = [node for node in self.graph.nodes(data=True)
+                if not isinstance(node[0], EthAddr)]
+    for s in switches:
+      assert 'connection' in s[1]
+
+      msg = of.ofp_flow_mod()
+      msg.match.dl_type = ethernet.IP_TYPE
+      msg.match.nw_dst = ip
+      msg.command = of.OFPFC_DELETE
+      s[1]['connection'].send(msg)
+
+      msg = of.ofp_flow_mod()
+      msg.match.dl_dst = mac
+      msg.command = of.OFPFC_DELETE
+      s[1]['connection'].send(msg)
+
+  def host_is_mobile (self, host_mac, is_mobile):
+    '''
+    Mark a host as mobile.
+    '''
+
+    assert host_mac in self.graph
+    self.graph.node[host_mac]['info'].is_mobile = is_mobile
+
+  def update_host (self, host, join=False, leave=False, move=False, new=None):
+    '''
+    When mobile_host_tracker generates HostEvents, then a host has
+    joined/left/moved around the network. Use these events to
+    add hosts to the graph.
+    '''
+
+    assert sum(1 for x in [join,leave,move] if x) == 1
+
+    if leave:
+      if host.macaddr in self.graph:
+        if host.ipaddr is not None:
+          self.delete_host_flows(host.ipaddr.ip, host.macaddr)
+        self.graph.remove_node(host.macaddr)
+        log.info('{0} --> {1} left'.format(host.macaddr, host.ipaddr.ip))
+
+    elif move:
+      assert new is not None
+      # NOTE: this would need to be changed if mupltiple interfaces
+      #       per host was supported
+      self.delete_host_flows(host.ipaddr.ip, host.macaddr)
+      for n in self.graph.neighbors(host.macaddr)[:]:
+        self.graph.remove_edge(host.macaddr, n)
+
+      # host ports not factored in
+      self.graph.add_edge(new.dpid, host.macaddr, port=new.port)
+      log.info('{0} moved from {1} port {2} --> {3} port {4}'.format(
+        host.macaddr, dpid, host.port, new.dpid, new.port))
+      host.dpid = new.dpid
+      host.port = new.port
+      host.refresh()
+
+    else: # join
+      self.graph.add_node(host.macaddr)
+      self.graph.add_edge(dpid, host.macaddr, port=host.port)
+      self.graph.node[host.macaddr]['info'] = host
+      host.refresh()
+      log.info('{0} joined on {1} port {2}'.format(host.macaddr, dpid, port))
+
+  def get_host_info(self, ip):
     '''
     Allows us to look up host MAC addresses by IP address, like
     what ARP does.
     '''
 
-    for host in self.hosts.itervalues():
-      hip = host.get_ip()
-      if hip == ip:
-          return host.entry.macaddr
+    # NOTE: new code
+
+    hosts = [node for node in self.graph.nodes(data=True)
+            if 'info' in node[1] and node[1]['info'].ip == ip]
+    if len(hosts) == 1:
+      return hosts[0][1]['info']
+    elif len(hosts) > 1:
+      log.warn("found multiple hosts with IP {0}".format(ip))
     return None
 
-  def get_host_ap(self, ip):
+  def _handle_openflow_PacketIn (self, event):
+    """
+    Populate MAC and IP tables based on incoming packets.
+
+    Handles only packets from ports identified as not switch-only.
+    If a MAC was not seen before, insert it in the MAC table;
+    otherwise, update table and enry.
+    If packet has a source IP, update that info for the host (may require
+    removing the info from antoher entry previously with that IP address).
+    It does not forward any packets, just extract info from them.
+    """
+
+    dpid = event.connection.dpid
+    inport = event.port
+    #subnet = self.dhcpd_multi.get_switch_subnet(dpid) # get the subnet of this switch
+
+    # if this is DHCP, raise event for DHCP server and halt event
+    if self.is_dhcp(event):
+      self.raiseEventNoErrors(DHCPEvent(event, self.graph))
+      return EventHalt
+
+    packet = event.parsed
+    if not packet.parsed:
+      log.warning("%i %i ignoring unparsed packet", dpid, inport)
+      return
+
+    if packet.type == ethernet.LLDP_TYPE: # Ignore LLDP packets
+      return
+
+    if not self.is_edge_port(dpid, inport):
+      # No host should be right behind a switch-only port
+      log.debug("%i %i ignoring packetIn at switch-only port", dpid, inport)
+      return
+
+    if packet.find('dhcp') is not None:
+      # leave this to DHCP lease events
+      return
+
+    log.debug("PacketIn: %i %i ETH %s => %s",
+              dpid, inport, str(packet.src), str(packet.dst))
+
+    # Learn or update dpid/port/MAC info
+    host = (packet.src in self.graph)
+    move = False
+
+    if host:
+      host = self.graph.node[packet.src]['info']
+
+    if not host:
+      host = Host(dpid,inport,packet.src)
+      self.host_update(host, join = True)
+
+    elif host != (dpid, inport, packet.src):
+      self.host_update(host, move = True, new = New(dpid, inport))
+      move = True
+
+    (pckt_srcip, hasARP) = self.getSrcIPandARP(packet.next)
+    if pckt_srcip is not None and pckt_srcip != '0.0.0.0':
+      self.updateIPInfo(pckt_srcip, host, hasARP)
+
+    #if move and host.ipaddr is not None:
+    #    if (not on_subnet(host.ipaddr.ip, subnet)):
+    #      self.dynamic_topology.host_is_mobile(host.macaddr, True)
+
+    if self.eat_packets and packet.dst == self.ping_src_mac:
+      return EventHalt
+
+  def is_dhcp (self, event):
     '''
-    For the given host ip, return the switch dpid it is currently
-    connected to.
+    Given packet in, return true if contents are DHCP, false
+    if not.
     '''
 
-    mac = str(self.get_host_mac_by_ip(ip))
-    if mac is None:
-      return None
-    dpid = self.hosts[mac].entry.dpid
-    if dpid is None:
-      return None
-    return dpid
+    ipp = event.parsed.find('ipv4')
+    if not ipp or not ipp.parsed:
+      return False
+    #if ipp.dstip not in (IP_ANY, IP_BROADCAST) and
+       #ipp.dstip not in self.core.values():
+      #return
+    nwp = ipp.payload
+    if not nwp or not nwp.parsed or not isinstance(nwp, pkt.udp):
+      return False
+    if nwp.srcport != pkt.dhcp.CLIENT_PORT:
+      return False
+    if nwp.dstport != pkt.dhcp.SERVER_PORT:
+      return False
+    p = nwp.payload
+    if not p:
+      log.debug("%s: no packet", str(event.connection))
+      return False
+    if not isinstance(p, pkt.dhcp):
+      log.debug("%s: packet is not DHCP", str(event.connection))
+      return False
+    if not p.parsed:
+      log.debug("%s: DHCP packet not parsed", str(event.connection))
+      return False
 
+    if p.op != p.BOOTREQUEST:
+      return False
+
+    t = p.options.get(p.MSG_TYPE_OPT)
+    if t is None:
+      return False
+
+    return True
+
+  # IP helpers
+  def getSrcIPandARP (self, packet):
+    """
+    Gets source IPv4 address for packets that have one (IPv4 and ARP)
+
+    Returns (ip_address, has_arp).  If no IP, returns (None, False).
+    """
+
+    if isinstance(packet, ipv4):
+      log.debug("IP %s => %s",str(packet.srcip),str(packet.dstip))
+      return (packet.srcip, False)
+    elif isinstance(packet, arp):
+      log.debug("ARP %s %s => %s",
+                {arp.REQUEST:"request",arp.REPLY:"reply"}.get(packet.opcode,
+                    'op:%i' % (packet.opcode,)),
+                str(packet.protosrc), str(packet.protodst))
+      if (packet.hwtype == arp.HW_TYPE_ETHERNET and
+          packet.prototype == arp.PROTO_TYPE_IP and
+          packet.protosrc != 0):
+        return (packet.protosrc, True)
+
+    return (None, False)
+
+  def updateIPInfo (self, pckt_srcip, host, hasARP):
+    """
+    Update given Host
+
+    If there is IP info in the incoming packet, update the host
+    accordingly. In the past we assumed a 1:1 mapping between MAC and IP
+    addresses, but removed that restriction later to accomodate cases
+    like virtual interfaces (1:n) and distributed packet rewriting (n:1)
+
+    I have reinstated the 1:1 mapping between MAC and IP addresses for
+    the purpose of this work.
+    """
+
+    if host.ipaddr is not None and pckt_srcip == host.ipaddr.ip:
+      # that entry already has that IP
+      ipEntry = host.ipaddr
+      ipEntry.refresh()
+      log.debug("%s already has IP %s, refreshing",
+                str(host), str(pckt_srcip))
+    else:
+      # new mapping
+      ipEntry = IPAddress(hasARP, pckt_srcip)
+      host.ipaddr = ipEntry
+      log.debug("Learned %s got IP %s", str(host), str(pckt_srcip))
+    if hasARP:
+      ipEntry.pings.received()
+
+  def sendPing (self, host, ipaddr):
+    """
+    Builds an ETH/IP any-to-any ARP packet (an "ARP ping")
+    """
+
+    r = arp()
+    r.opcode = arp.REQUEST
+    r.hwdst = host.macaddr
+    r.hwsrc = self.ping_src_mac
+    r.protodst = ipaddr
+    # src is IP_ANY
+    e = ethernet(type=ethernet.ARP_TYPE, src=r.hwsrc, dst=r.hwdst)
+    e.payload = r
+    log.debug("%i %i sending ARP REQ to %s %s",
+              host.dpid, host.port, str(r.hwdst), str(r.protodst))
+    msg = of.ofp_packet_out(data = e.pack(),
+                            action = of.ofp_action_output(port=host.port))
+    if core.openflow.sendToDPID(host.dpid, msg.pack()):
+      ipEntry = host.ipaddr
+      ipEntry.pings.sent()
+    else:
+      # host is stale, remove it.
+      log.debug("%i %i ERROR sending ARP REQ to %s %s",
+                host.dpid, host.port, str(r.hwdst), str(r.protodst))
+      del host.ipaddrs[ipaddr]
+    return
+
+
+# launch DynamicTopology
 def launch(debug="False"):
     if not core.hasComponent("dynamic_topology"):
         core.register("dynamic_topology", DynamicTopology(str_to_bool(debug)))

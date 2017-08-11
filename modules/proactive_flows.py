@@ -1,6 +1,7 @@
-# Install proactive flow rules. Relies on dynamic_topology.
-# 2017 Adam Calabrigo
+# proactive_flows.py 2017 Adam Calabrigo
+# Install proactive flow rules based on dynamic_topology and dhcpd_multi.
 
+# POX
 from pox.core import core
 from pox.lib.addresses import EthAddr, IPAddr
 from pox.lib.packet.ethernet import ethernet
@@ -17,16 +18,31 @@ from pox.lib.revent.revent import *
 from pox.lib.util import dpid_to_str, str_to_bool
 import pox
 
+# networkX
+from networkx.algorithms.shortest_paths.generic import shortest_path
+
 log = core.getLogger()
 
 all_ports = of.OFPP_FLOOD
 
 GATEWAY_DUMMY_MAC = '03:00:00:00:be:ef'
 
+
 def dpid_to_mac (dpid):
+  '''
+  Convert the dpid to a MAC address.
+  '''
+
   return EthAddr("%012x" % (dpid & 0xffFFffFFffFF,))
 
+
 class ProactiveFlows (object):
+  '''
+  Install flow rules based on network topology. Rules are installed based on
+  switch location in the network. Core switches receive broad L3 rules at the
+  subnet level, while non-core switches receive IP-specific rules.
+  '''
+
   def __init__ (self, idle_timeout=300):
     self.idle_timeout = idle_timeout
     core.openflow.addListeners(self)
@@ -34,39 +50,6 @@ class ProactiveFlows (object):
 
   def _all_dependencies_met (self):
     log.info("proactive_flows ready")
-
-  def is_edge_node (self, node):
-    '''
-    Determines whether a switch in the network is centralized or
-    at an edge.
-    '''
-
-    adj_nodes = self.dynamic_topology.graph.get(node)
-    if adj_nodes is not None:
-      adj_switches = [n for n in adj_nodes if '-' in n]
-      if len(adj_switches) > 1:
-        return False
-    return True
-
-  def find_shortest_path (self, graph, start, end, path=[]):
-    '''
-    Finds the shortest path between two devices.
-    '''
-
-    path = path + [start]
-    if start == end:
-      return path
-    if not start in graph:
-      log.debug('ended at {0}'.format(start))
-      return None
-    shortest = None
-    for node in graph[start]:
-      if node not in path:
-        newpath = self.find_shortest_path(graph, node, end, path)
-        if newpath:
-          if not shortest or len(newpath) < len(shortest):
-            shortest = newpath
-    return shortest
 
   def _edge_reply(self, dst, node1, node2):
     '''
@@ -76,14 +59,16 @@ class ProactiveFlows (object):
     msg = of.ofp_flow_mod()
     msg.match.dl_type = ethernet.IP_TYPE
     msg.match.nw_dst = dst
-    port = self.dynamic_topology.switches[node1].get_device_port(node2)
+    port = self.dynamic_topology.get_link_port(node1, node2)
+
     if port is None:
       log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
       return
     else:
       msg.idle_timeout = self.idle_timeout
       msg.actions.append(of.ofp_action_output(port = port))
-    self.dynamic_topology.switches[node1].connection.send(msg)
+
+    self.dynamic_topology.graph.node[node1]['connection'].send(msg)
 
     def _edge_reply_local(self, dst, node1, node2):
       '''
@@ -93,27 +78,27 @@ class ProactiveFlows (object):
 
       msg = of.ofp_flow_mod()
       msg.match.dl_dst = dst
-      port = self.dynamic_topology.switches[node1].get_device_port(node2)
+      port = self.dynamic_topology.get_link_port(node1, node2)
+
       if port is None:
         log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
         return
       else:
         msg.idle_timeout = self.idle_timeout
         msg.actions.append(of.ofp_action_output(port = port))
-      self.dynamic_topology.switches[node1].connection.send(msg)
+
+      self.dynamic_topology.graph.node[node1]['connection'].send(msg)
       log.debug("Installing local L2 flow %s <-> %s" % (packet.src, packet.dst))
 
-  def _central_reply(self, dst, node1, node2, mobile=False):
+  def _core_reply(self, dst, node1, node2, mobile=False):
     '''
     Create a flow mod packet for a central switch.
     '''
     # flow mod for outgoing packets
     msg = of.ofp_flow_mod()
     msg.match.dl_type = ethernet.IP_TYPE
-    is_mobile = (dst in self.dynamic_topology.mobile_hosts.values())
     subnet = self.dhcpd_multi.get_subnet(dst)
 
-    #log.info('flow for {0} on subnet {1} is_mobile? {2}'.format(dst, subnet, is_mobile))
     if not mobile:
       msg.match.nw_dst = subnet
       if msg.match.nw_dst is None:
@@ -123,14 +108,14 @@ class ProactiveFlows (object):
       msg.match.nw_dst = dst
       msg.priority = 0x8000 + 50
 
-    port = self.dynamic_topology.switches[node1].get_device_port(node2)
+    port = self.dynamic_topology.get_link_port(node1, node2)
     if port is None:
       log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
       return
     else:
       msg.idle_timeout = self.idle_timeout
       msg.actions.append(of.ofp_action_output(port = port))
-      self.dynamic_topology.switches[node1].connection.send(msg)
+      self.dynamic_topology.graph.node[node1]['connection'].send(msg)
 
   def _handle_PacketIn (self, event):
     '''
@@ -139,6 +124,7 @@ class ProactiveFlows (object):
     entries to install in which switches based on the received packet
     and the network topology.
     '''
+
     packet = event.parsed
     dpid = event.connection.dpid
 
@@ -159,13 +145,15 @@ class ProactiveFlows (object):
       if isinstance(net_packet, udp):
         if (net_packet.srcport == dhcp.CLIENT_PORT and
             net_packet.dstport == dhcp.SERVER_PORT):
+          log.warn("saw DHCP packet, this shouldn't happen")
           return
 
       # this is the host sending a packet to its "default gateway" which doesn't
       # really exist
       true_dst = packet.dst
       if packet.dst == EthAddr(GATEWAY_DUMMY_MAC):
-        true_dst = self.dynamic_topology.get_host_mac_by_ip(ip_packet.dstip)
+        host = self.dynamic_topology.get_host_info(ip_packet.dstip)
+        true_dst = host.macaddr
         if true_dst is None:
           log.warning('Host with IP {0} is not on this network'.format(ip_packet.dstip))
           return
@@ -173,13 +161,15 @@ class ProactiveFlows (object):
       # retrieve graph info, find shortest path between devices
       #log.info("{0} Looking for path from {1} to {2}".format(dpid, packet.src, true_dst))
       graph = self.dynamic_topology.graph.copy()
+      path = shortest_path(graph, packet.src, true_dst)
 
-      path = self.find_shortest_path(graph, str(packet.src), str(true_dst))
-      log.debug("path found: {0}".format(path))
+      if path is not None:
+        log.debug("path found: {0}".format(path))
+      else:
+        log.warn("No path found for {0} => {1}!".format(str(packet.src),
+                 str(true_dst)))
+        return
 
-      if path is None:
-          log.debug("No path found, waiting on mobile_host_tracker")
-          return
       for i in range(1, len(path) - 1):
         device = path[i]
         log.debug("adding flows to {0}".format(device))
@@ -187,23 +177,26 @@ class ProactiveFlows (object):
         # if edge node, add flows for MAC
         #NOTE: checking if switch is at an edge is fine, as long as the assumption
         #      holds that only edge switches have hosts
-        if self.dhcpd_multi.is_central(device) == False:
+        if self.dhcpd_multi.is_core(device) == False:
           self._edge_reply(ip_packet.dstip, device, path[i + 1])
           self._edge_reply(ip_packet.srcip, device, path[i - 1])
 
         else:   # central, so add flows for IP SUBNETS
-          self._central_reply(ip_packet.dstip, device, path[i + 1],
-            mobile=(ip_packet.dstip in self.dynamic_topology.mobile_hosts.values()))
-          self._central_reply(ip_packet.srcip, device, path[i - 1],
-            mobile=(ip_packet.srcip in self.dynamic_topology.mobile_hosts.values()))
+          self._core_reply(ip_packet.dstip, device, path[i + 1],
+            mobile=(ip_packet.dstip in self.dhcpd_multi.mobile_hosts))
+          self._core_reply(ip_packet.srcip, device, path[i - 1],
+            mobile=(ip_packet.srcip in self.dhcpd_multi.mobile_hosts))
 
       # forward the buffer out the first hop port
-      msg = of.ofp_packet_out(buffer_id = event.ofp.buffer_id, in_port = event.ofp.in_port)
-      assert len(path) >= 3
-      port = self.dynamic_topology.switches[path[1]].get_device_port(path[2])
-      action = of.ofp_action_output(port = port)
-      msg.actions.append(action)
-      event.connection.send(msg)
+      #msg = of.ofp_packet_out(buffer_id = event.ofp.buffer_id, in_port = event.ofp.in_port)
+      msg = of.ofp_packet_out()
+      if len(path) >= 3:
+        port = self.dynamic_topology.get_link_port(path[1], path[2])
+        action = of.ofp_action_output(port = port)
+        msg.actions.append(action)
+        msg.data = event.ofp
+        msg.in_port = event.port
+        event.connection.send(msg)
 
     # CASE 2: the switch gets an ARP request from a host. In this case,
     # create an ARP reply based on the known network topology. Send this
@@ -235,8 +228,8 @@ class ProactiveFlows (object):
               if self.dhcpd_multi.is_router(arp_packet.protodst):
                 arp_reply.hwsrc = EthAddr(GATEWAY_DUMMY_MAC)
               else:
-                arp_reply.hwsrc = self.dynamic_topology.get_host_mac_by_ip(
-                  arp_packet.protodst)
+                host = self.dynamic_topology.get_host_info(arp_packet.protodst)
+                arp_reply.hwsrc = host.macaddr
 
               if arp_reply.hwsrc is None:
                 #log.info("Host unknown, broadcasting ARP")
@@ -271,15 +264,16 @@ class ProactiveFlows (object):
         log.warn('Packet of type {0} not supported yet'.format(type(packet.next)))
         return
 
-      if str(dst) in self.dynamic_topology.hosts:
+      if dst in self.dynamic_topology.graph:
         log.debug("{0} Looking for path from {1} to {2}".format(dpid, src, dst))
         graph = self.dynamic_topology.graph.copy()
-        path = self.find_shortest_path(graph, str(src), str(dst))
-        log.debug("path found: {0}".format(path))
+        path = shortest_path(graph, src, dst)
 
-        if path is None:
-            log.debug("No path found, waiting on mobile_host_tracker")
-            return
+        if path is not None:
+          log.debug("Path found: {0}".format(path))
+        else:
+          log.debug("No path found!")
+          return
 
         if not self.dhcpd_multi.is_local_path(path):
           log.warn('Ignoring non-local path {0} -> {1}'.format(str(src), str(dst)))
@@ -291,6 +285,7 @@ class ProactiveFlows (object):
           self._edge_reply_local(src, device, path[i - 1])
 
       return
+
 
 def launch(idle_timeout=300):
   if not core.hasComponent("proactive_flows"):

@@ -1,5 +1,11 @@
-# Copyright 2013 James McCauley
-#
+# dhcpd_multi.py 2017 Adam Calabrigo
+
+# A modified version of dhcpd.py capable of handling multiple subnets
+# on a single network, and makes the leases actually expire.
+
+# Built on dhcpd.py        - Copyright 2013 James McCauley
+#          host_tracker.py - Copyright 2011 Dorgival Guedes
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
@@ -12,53 +18,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Based on dhcpd.py.
-
-2017 Adam Calabrigo
-CH-CH-CHANGES:
-
-Makes the leases actually time out. Adds support for multiple subnets on the
-network.
-"""
-
+# POX
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
 import pox.lib.packet as pkt
 from pox.lib.packet.arp import arp
 from pox.lib.packet.ethernet import ethernet
-
 from pox.lib.addresses import IPAddr,EthAddr,parse_cidr
 from pox.lib.addresses import IP_BROADCAST, IP_ANY
 from pox.lib.revent import *
 from pox.lib.util import dpid_to_str
 from pox.lib.recoco import Timer
 
+# networkX
+from networkx.algorithms.clique import find_cliques
+from networkx.algorithms.shortest_paths.generic import shortest_path
+
+# general
 import time
-import yaml
-import os
+from collections import namedtuple
 
 GATEWAY_DUMMY_MAC = '03:00:00:00:be:ef'
-
 log = core.getLogger()
 
 # Times (in seconds) to use for differente timouts:
 timeoutSec = dict(
-  timerInterval=5,      # Seconds between timer routine activations
+  timerInterval=5,     # Seconds between timer routine activations
   leaseInterval=60*60  # Time until DHCP leases expire - 1 hour
   )
 
+# used in Subnet
+Server = namedtuple('Server', 'dpid addr')
+
+
 def ip_for_event (event):
   """
-  Use a switch's DPID as an EthAddr
+  Use a switch's DPID as an EthAddr.
   """
+
   eth = dpid_to_str(event.dpid,True).split("|")[0].replace("-",":")
   return EthAddr(eth)
 
-def dpid_to_mac (dpid):
-    return EthAddr("%012x" % (dpid & 0xffFFffFFffFF,))
 
-class Alive (object): # from host_tracker
+# from host_tracker.py
+class Alive (object):
   """
   Holds liveliness information for address pool entries
   """
@@ -72,10 +75,12 @@ class Alive (object): # from host_tracker
   def refresh (self):
     self.lastTimeSeen = time.time()
 
+
 class LeaseEntry (Alive):
   """
-  Leased IP address.
+  Holds information for leased IP addresses.
   """
+
   def __init__ (self, ip):
     super(LeaseEntry,self).__init__()
     self.ip = IPAddr(ip)
@@ -97,29 +102,8 @@ class LeaseEntry (Alive):
   def __ne__ (self, other):
     return not self.__eq__(other)
 
-class DHCPLease (Event):
-  """
-  Raised when a lease is given
 
-  Call nak() to abort this lease
-  """
-  def __init__ (self, host_mac, ip_entry, port=None,
-                dpid=None, renew=False, expire=False, is_mobile=False):
-    super(DHCPLease, self).__init__()
-    self.host_mac = host_mac
-    self.ip = ip_entry.ip
-    self.port = port
-    self.dpid = dpid
-    self.renew = renew
-    self.expire = expire
-    self.is_mobile = is_mobile
-    self._nak = False
-
-    assert sum(1 for x in [renew, expire] if x) == 1
-
-  def nak (self):
-    self._nak = True
-
+# unmodified from original dhcpd.py
 class AddressPool (object):
   """
   Superclass for DHCP address pools
@@ -132,6 +116,7 @@ class AddressPool (object):
   (e.g., getitem) are potentially difficult to implement and not particularly
   useful (since we only need to remove a single item at a time).
   """
+
   def __init__ (self):
     """
     Initialize this pool.
@@ -170,10 +155,12 @@ class AddressPool (object):
     """
     pass
 
+
 class SimpleAddressPool (AddressPool):
   """
   Simple AddressPool for simple subnet based pools.
   """
+
   def __init__ (self, network = "192.168.0.0/24", first = 1, last = None,
                 count = None):
     """
@@ -188,6 +175,7 @@ class SimpleAddressPool (AddressPool):
     Example for all of 192.168.x.x/16:
       SimpleAddressPool("192.168.0.0/16", 1, 65534)
     """
+
     network,network_size = parse_cidr(network)
 
     self.first = first
@@ -286,24 +274,53 @@ class SimpleAddressPool (AddressPool):
       c += 1
       if c > self.last: c -= self.count
 
-class DHCPServer (object):
 
-  def __init__ (self, server, ip_address = "192.168.0.254", router_address = (),
-                dns_address = (), pool = None, switches = None, subnet = None,
-                install_flow = True):
+# new and modified code starts here
+class DHCPLease (Event):
+  """
+  Raised when a lease is given
+
+  Call nak() to abort this lease
+  """
+
+  def __init__ (self, host_mac, ip_entry, port=None,
+                dpid=None, renew=False, expire=False):
+    super(DHCPLease, self).__init__()
+    self.host_mac = host_mac
+    self.ip = ip_entry.ip
+    self.port = port
+    self.dpid = dpid
+    self.renew = renew
+    self.expire = expire
+    self.is_mobile = is_mobile
+    self._nak = False
+
+    assert sum(1 for x in [renew, expire] if x) == 1
+
+  def nak (self):
+    self._nak = True
+
+
+class Subnet (object):
+  '''
+  Holds the information for one subnet in the network. This includes
+  the network address, the IP address pool, the dpids of all switches
+  in this subnet, the IP address of this subnet's DNS server (if different),
+  and the dpid and IP of the subnets DHCP server. Note that this address is
+  really just a dummy address.
+  '''
+
+  def __init__ (self, network, pool, switches, server, dns = None):
 
     def fix_addr (addr, backup):
       if addr is None: return None
       if addr is (): return IPAddr(backup)
       return IPAddr(addr)
 
-    self._install_flow = install_flow
+    self.network = network
+    self.dns_addr = fix_addr(dns, server.addr)
 
-    self.ip_addr = IPAddr(ip_address)
-    self.router_addr = fix_addr(router_address, ip_address)
-    self.dns_addr = fix_addr(dns_address, self.router_addr)
-    self.server = server
-
+    # pool must be set properly
     if pool is None:
       self.pool = [IPAddr("192.168.0."+str(x)) for x in range(100,199)]
       self.subnet = IPAddr(subnet or "255.255.255.0")
@@ -316,92 +333,113 @@ class DHCPServer (object):
         raise RuntimeError("You must specify a subnet mask or use a "
                            "pool with a subnet hint")
 
+    self.address_pool = pool
     self.switches = switches
-    self._install_flows()
-    self.lease_time = timeoutSec['leaseInterval']
 
-    self.offers = {} # Eth -> IP we offered
-    self.leases = {} # Eth -> IP we leased, as LeaseEntry
+    assert isinstance(server, (int, IPAddr))
+    self.server = Server(server) # (dpid, ipaddr)
 
-    if self.ip_addr in self.pool:
-      log.debug("Removing my own IP (%s) from address pool", self.ip_addr)
-      self.pool.remove(self.ip_addr)
+    if self.server.addr in self.pool:
+      log.debug("Removing my own IP (%s) from address pool", self.server.addr)
+      self.pool.remove(self.server.addr)
 
-    self._t = Timer(timeoutSec['timerInterval'], self._check_leases,
-                    recurring=True)
 
-  # on switch connect, install flow
-  def _install_flows (self):
-    if self._install_flow:
-      msg = of.ofp_flow_mod()
-      msg.match = of.ofp_match()
-      msg.match.dl_type = pkt.ethernet.IP_TYPE
-      msg.match.nw_proto = pkt.ipv4.UDP_PROTOCOL
-      #msg.match.nw_dst = IP_BROADCAST
-      msg.match.tp_src = pkt.dhcp.CLIENT_PORT
-      msg.match.tp_dst = pkt.dhcp.SERVER_PORT
-      msg.actions.append(of.ofp_action_output(port = of.OFPP_CONTROLLER))
-      #msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD))
+class DHCPDMulti (EventMixin):
+  '''
+  DHCP Server that handles multiple subnets in the network.
+  '''
 
-      # add flows to the switches covered by this server
-      # only listen to switches on this server
-      for s in self.switches:
-          self.server.dynamic_topology.switches[dpid_to_str(s)].connection.send(msg)
-          self.server.dynamic_topology.switches[dpid_to_str(s)].connection.addListeners(self)
+  _eventMixin_events = set([DHCPLease])
 
-  def _get_pool (self, event):
-    """
-    Get an IP pool for this event.
+  def __init__(self, networks = "192.168.0.0/24", dns = None):
 
-    Return None to not issue an IP.  You should probably log this.
-    """
-    return self.pool
+      # attributes of our network
+      self.network, self.network_size = parse_cidr(network)
+      self.dns_addr = dns
+      self.subnets = {}  # IP -> subnet
+      self.core = {} # dpid -> IP
+      self.mobile_hosts = [] # macs
 
-  # checks the packet, processes DHCP msg from client
-  def _handle_PacketIn (self, event):
-    # Is it to us?  (Or at least not specifically NOT to us...)
-    ipp = event.parsed.find('ipv4')
-    if not ipp or not ipp.parsed:
-      return
+      # attributes to track DHCP
+      self.lease_time = timeoutSec['leaseInterval']
+      self.offers = {} # Subnet -> {Eth -> IP we offered}
+      self.leases = {} # Subnet -> {Eth -> LeaseEntry}
+      self._t = Timer(timeoutSec['timerInterval'], self._check_leases,
+                      recurring=True)
 
-    if ipp.dstip not in (IP_ANY,IP_BROADCAST,self.ip_addr):
-      return
-    nwp = ipp.payload
-    if not nwp or not nwp.parsed or not isinstance(nwp, pkt.udp):
-      return
-    if nwp.srcport != pkt.dhcp.CLIENT_PORT:
-      return
-    if nwp.dstport != pkt.dhcp.SERVER_PORT:
-      return
-    p = nwp.payload
-    if not p:
-      log.debug("%s: no packet", str(event.connection))
-      return
-    if not isinstance(p, pkt.dhcp):
-      log.debug("%s: packet is not DHCP", str(event.connection))
-      return
-    if not p.parsed:
-      log.debug("%s: DHCP packet not parsed", str(event.connection))
-      return
+      # if this is the first time the server has been started up
+      self._first_stable = True
 
-    if p.op != p.BOOTREQUEST:
-      return
+      core.openflow.addListeners(self)
 
-    t = p.options.get(p.MSG_TYPE_OPT)
-    if t is None:
-      return
+  def _handle_ConnectionUp (self, event):
+    '''
+    When switches connect, install a flow rule to send all DHCP traffic
+    to the controller automatically.
+    '''
 
-    pool = self._get_pool(event)
-    if pool is None:
-      return
+    msg = of.ofp_flow_mod()
+    msg.match = of.ofp_match()
+    msg.match.dl_type = pkt.ethernet.IP_TYPE
+    msg.match.nw_proto = pkt.ipv4.UDP_PROTOCOL
+    #msg.match.nw_dst = IP_BROADCAST
+    msg.match.tp_src = pkt.dhcp.CLIENT_PORT
+    msg.match.tp_dst = pkt.dhcp.SERVER_PORT
+    msg.actions.append(of.ofp_action_output(port = of.OFPP_CONTROLLER))
+    #msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD))
+    event.connection.send(msg)
 
-    if t.type == p.DISCOVER_MSG:
-      self.exec_discover(event, p, pool)
-    elif t.type == p.REQUEST_MSG:
-      self.exec_request(event, p, pool)
-    elif t.type == p.RELEASE_MSG:
-      self.exec_release(event, p, pool)
-    return EventHalt
+  def _handle_core_ComponentRegistered (self, event):
+    '''
+    We want to listen to StableEvents, this sets that up.
+    '''
+
+    if event.name == "dynamic_topology":
+      event.component.addListenerByName("StableEvent",
+          self._handle_dynamic_topology_StableEvent)
+      event.component.addListenerByName("DHCPEvent",
+          self._handle_dynamic_topology_DHCPEvent)
+      log.info('connected to dynamic_topology')
+
+  def _handle_dynamic_topology_StableEvent(self, event):
+    '''
+    When the topology is stable, start the DHCP server.
+    '''
+
+    graph = event.graph
+    if event.stable and self._first_stable:
+      core = find_cliques(graph).next()
+      core_ips = []
+
+      if core is None:
+        log.warn('No core mesh found in this network...')
+        return
+
+      core_switches = {s:[] for s in core}
+      not_core = [node for node in graph if node not in core and
+                  not isinstance(node, EthAddr)]
+
+      for switch in not_core:
+        closest_core = min(core, key=lambda x: len(shortest_path(
+                           graph, source=switch, target=x)))
+        core_switches[closest_core].append(switch)
+
+      for core,i in enumerate(core_switches):
+        network_addr = IPAddr(self.network) | (i << (32 - self.network_size))
+        server_addr = network_addr + 1
+        core_ips.append(server_addr)
+        pool = SimpleAddressPool(str(network_addr) + '/' + self.network_size)
+        subnet = Subnet(ip_address = server_addr, pool = pool,
+                        switches = core_switches[core], server = (core, server_addr),
+                        dns = self.dns_addr)
+        self.subnets[server_addr] = subnet
+        self.leases[subnet] = {}
+        self.offers[subnet] = {}
+        self.core = dict(zip(core, core_ips))
+        log.info('{0} serves subnet {1} on switches {2}'.format(server_addr,
+                                                                network_addr,
+                                                                core_switches[core]))
+      self._first_stable = False
 
   def _check_leases (self):
     """
@@ -421,12 +459,61 @@ class DHCPServer (object):
           self.nak(event)
           return
 
-        # if this host was mobile, delete it from mobile host table
-        #if client in self.server.mobile_hosts:
-          #del self.server.mobile_hosts[client]
+  def _get_subnet (self, event):
+    """
+    Get a subnet for this event.
 
-  def reply (self, event, msg):
-    # this seems to encapsulate our DHCP packets in the proper headers
+    Return None to not issue a subnet.  You should probably log this.
+    """
+
+    subnet = [subnet for subnet in self.subnets
+              for switches in subnet if event.dpid in switches]
+    assert len(subnet) == 1
+    return subnet[0]
+
+  def _handle_dynamic_topology_DHCPEvent (self, event):
+    # Is it to us?  (Or at least not specifically NOT to us...)
+    ipp = event.parsed.find('ipv4')
+    if ipp.dstip not in (IP_ANY, IP_BROADCAST) and
+       ipp.dstip not in self.core.values():
+      return
+
+    nwp = ipp.payload
+    p = nwp.payload
+    t = p.options.get(p.MSG_TYPE_OPT)
+
+    subnet = self._get_subnet(event)
+    if subnet is None:
+      return
+
+    # ALL mobility checking done here!
+    src = event.parsed.src
+    host = event.graph.node[src]
+    if host is not None:
+      ip_addr = host['info'].ipaddr
+      if ip_addr is not None:
+        ip_addr = ip_addr.ip
+        home_subnet = [self.subnets[s] for s in self.subnets if ip_addr
+                          in self.subnets[s].pool.removed]
+        assert len(home_subnet) is 1
+        home_subnet = home_subnet[0]
+        if home_subnet != subnet and src not in self.mobile_hosts:
+          log.info('{0} moved from {1} to {2}, is now mobile with {3}'.format(
+                   src, home_subnet.server.addr, subnet.server.addr, ip_addr))
+          subnet = home_subnet
+          self.mobile_hosts.append(src)
+        elif home_subnet == subnet and src in self.mobile_hosts:
+          self.mobile_hosts.remove(src)
+
+    if t.type == p.DISCOVER_MSG:
+      self.exec_discover(event, p, subnet)
+    elif t.type == p.REQUEST_MSG:
+      self.exec_request(event, p, subnet)
+    elif t.type == p.RELEASE_MSG:
+      self.exec_release(event, p, subnet)
+    return EventHalt
+
+  def reply (self, event, subnet, msg):
 
     # fill out the rest of the DHCP packet
     orig = event.parsed.find('dhcp')
@@ -436,12 +523,12 @@ class DHCPServer (object):
     msg.htype = 1
     msg.hlen = 6
     msg.xid = orig.xid
-    msg.add_option(pkt.DHCP.DHCPServerIdentifierOption(self.ip_addr))
+    msg.add_option(pkt.DHCP.DHCPServerIdentifierOption(subnet.server.addr))
 
     # create ethernet header
     ethp = pkt.ethernet(src=ip_for_event(event),dst=event.parsed.src)
     ethp.type = pkt.ethernet.IP_TYPE
-    ipp = pkt.ipv4(srcip = self.ip_addr)
+    ipp = pkt.ipv4(srcip = subnet.server.addr)
     ipp.dstip = event.parsed.find('ipv4').srcip
     if broadcast:
       ipp.dstip = IP_BROADCAST
@@ -461,30 +548,63 @@ class DHCPServer (object):
     po.actions.append(of.ofp_action_output(port=event.port))
     event.connection.send(po)
 
-  def nak (self, event, msg = None):
+  def nak (self, event, subnet, msg = None):
     if msg is None:
       msg = pkt.dhcp()
     msg.add_option(pkt.DHCP.DHCPMsgTypeOption(msg.NAK_MSG))
-    msg.siaddr = self.ip_addr
-    self.reply(event, msg)
+    msg.siaddr = subnet.server.addr
+    self.reply(event, subnet, msg)
 
-  def exec_release (self, event, p, pool):
+  def fill (self, wanted_opts, subnet, msg):
+    """
+    Fill out some options in msg
+    """
+    if msg.SUBNET_MASK_OPT in wanted_opts:
+      msg.add_option(pkt.DHCP.DHCPSubnetMaskOption(subnet.subnet))
+    if msg.ROUTERS_OPT in wanted_opts and subnet.server.addr is not None:
+      msg.add_option(pkt.DHCP.DHCPRoutersOption(subnet.server.addr))
+    if msg.DNS_SERVER_OPT in wanted_opts and subnet.dns_addr is not None:
+      msg.add_option(pkt.DHCP.DHCPDNSServersOption(subnet.dns_addr))
+    msg.add_option(pkt.DHCP.DHCPIPAddressLeaseTimeOption(self.lease_time))
+
+  def exec_discover (self, event, p, subnet):
+    # creates an OFFER in response to a DISCOVER
+    reply = pkt.dhcp()
+    reply.add_option(pkt.DHCP.DHCPMsgTypeOption(p.OFFER_MSG))
     src = event.parsed.src
-    if src != p.chaddr:
-      log.warn("%s tried to release %s with bad chaddr" % (src,p.ciaddr))
-      return
-    if self.leases.get(p.chaddr) != p.ciaddr:
-      log.warn("%s tried to release unleased %s" % (src,p.ciaddr))
-      return
-    del self.leases[p.chaddr]
-    pool.append(p.ciaddr)
 
-    if src in self.server.dynamic_topology.mobile_hosts:
-      del self.server.dynamic_topology.mobile_hosts[src]
+    # if this host already has a lease
+    if src in self.leases[subnet]:
+      offer = self.leases[subnet][src].ip   # offer it the same address
+      del self.leases[subnet][src]
+      self.offers[subnet][src] = offer      # move from leases to offers
 
-    log.debug("%s released %s" % (src,p.ciaddr))
+    # otherwise check if we already offered an address to this host
+    else:
+      offer = self.offers[subnet].get(src)
+      if offer is None:
+        if len(subnet.pool) == 0:
+          log.error("Out of IP addresses")
+          self.nak(event, subnet)
+          return
 
-  def exec_request (self, event, p, pool):
+        offer = subnet.pool[0] # offer the first available address
+        if p.REQUEST_IP_OPT in p.options: # if host requested specific address
+          wanted_ip = p.options[p.REQUEST_IP_OPT].addr
+          if wanted_ip in subnet.pool:
+            offer = wanted_ip
+        subnet.pool.remove(offer)
+        self.offers[subnet][src] = offer
+    reply.yiaddr = offer            # your IP
+    reply.siaddr = subnet.server.addr     # server's IP
+
+    wanted_opts = set()
+    if p.PARAM_REQ_OPT in p.options:
+      wanted_opts.update(p.options[p.PARAM_REQ_OPT].options)
+    self.fill(wanted_opts, subnet, reply)
+    self.reply(event, subnet, reply)
+
+  def exec_request (self, event, p, subnet):
     # create and send ACKNOWLEDGE in response to REQUEST
 
     if not p.REQUEST_IP_OPT in p.options:
@@ -493,230 +613,79 @@ class DHCPServer (object):
 
     # if client asks for specific IP
     wanted_ip = p.options[p.REQUEST_IP_OPT].addr
-    src = event.parsed.src  # src MAC
+    src = event.parsed.src
     dpid = event.connection.dpid
     port = event.port
     got_ip = None
-    is_mobile = (src in self.server.dynamic_topology.mobile_hosts)
 
     # renew
-    if src in self.leases:
-      if wanted_ip != self.leases[src]:
-        # if the host is mobile but is not asking for a different address,
-        # we want to consider it no longer mobile
-        if is_mobile:
-          del self.server.dynamic_topology.mobile_hosts[src]
-        pool.append(self.leases[src].ip)
-        del self.leases[src]
+    if src in self.leases[subnet]:
+      if wanted_ip != self.leases[subnet][src]:
+        subnet.pool.append(self.leases[subnet][src].ip)
+        del self.leases[subnet][src]
       else:
-        got_ip = self.leases[src]
+        got_ip = self.leases[subnet][src]
         got_ip.refresh() # this is a lease renew
 
     # respond to offer
     if got_ip is None:
-      if src in self.offers:    # if there was an offer to this client
-        if wanted_ip != self.offers[src]:
-          pool.append(self.offers[src])
+      if src in self.offers[subnet]:    # if there was an offer to this client
+        if wanted_ip != self.offers[subnet][src]:
+          pool.append(self.offers[subnet][src])
+          del self.offers[subnet][src]
         else:
-          got_ip = LeaseEntry(self.offers[src])
-        del self.offers[src]
+          got_ip = LeaseEntry(self.offers[subnet][src])
 
     # new host request
     if got_ip is None:
-      if wanted_ip in pool:
-        pool.remove(wanted_ip)
+      if wanted_ip in subnet.pool:
+        subnet.pool.remove(wanted_ip)
         got_ip = LeaseEntry(wanted_ip)
-        # this host is mobile, yet it is new on our server and is asking for
-        # an address on this server... we should no longer consider it mobile
-        # NOTE: we let the lease expire on its current server for convenience
-        if is_mobile:
-          del self.server.dynamic_topology.mobile_hosts[src]
-
-    # check for mobile host
-    if got_ip is None:
-      mobile_ip = self.server.dynamic_topology.mobile_hosts.get(src)
-      # mobile host already discovered, renew lease from original server
-      if mobile_ip is not None and mobile_ip == wanted_ip:
-        log.debug('{0} recognized mobile host {1}'.format(self.ip_addr, src))
-        subnet = [s for s in self.server.subnets.itervalues() if src in s.leases]
-        if subnet is None:
-          raise RuntimeError("%s designated mobile but not found on server" % (src,))
-          return
-        if len(subnet) > 1:
-          raise RuntimeError("%s found on multiple servers" % (src,))
-          return
-        subnet = subnet[0]
-        subnet.exec_request(event, p, subnet.pool)
-        return
-
-      else: # new mobile host found
-        for subnet in [s for s in self.server.subnets.itervalues() if s != self]:
-          mobile_ip = subnet.leases.get(src)
-          if mobile_ip is not None and mobile_ip.ip == wanted_ip:
-            log.debug("%s is now mobile with IP %s", src, wanted_ip)
-            self.server.dynamic_topology.mobile_hosts[src] = wanted_ip
-            subnet.exec_request(event, p, subnet.pool)
-            return
 
     if got_ip is None:
       log.warn("%s asked for un-offered %s", src, wanted_ip)
-      self.nak(event)
+      self.nak(event, subnet)
       return
 
     assert got_ip == wanted_ip
-    self.leases[src] = got_ip
-    ev = DHCPLease(src, got_ip, port, dpid, renew=True, is_mobile=is_mobile)
-    self.server.raiseEvent(ev)
+    self.leases[subnet][src] = got_ip
+    ev = DHCPLease(src, got_ip, port, dpid, renew=True)
+    self.raiseEvent(ev)
     if ev._nak:
-      self.nak(event)
+      self.nak(event, subnet)
       return
-    log.debug("%s leased %s to %s" % (self.ip_addr, got_ip, src))
+    log.debug("%s leased %s to %s" % (subnet.server.addr, got_ip, src))
 
     # create ack reply
     reply = pkt.dhcp()
     reply.add_option(pkt.DHCP.DHCPMsgTypeOption(p.ACK_MSG))
     reply.yiaddr = wanted_ip
-    reply.siaddr = self.ip_addr
+    reply.siaddr = subnet.server.addr
 
     wanted_opts = set()
     if p.PARAM_REQ_OPT in p.options:
       wanted_opts.update(p.options[p.PARAM_REQ_OPT].options)
-    self.fill(wanted_opts, reply)
+    self.fill(wanted_opts, subnet, reply)
 
-    self.reply(event, reply)
+    self.reply(event, subnet, reply)
 
-  def exec_discover (self, event, p, pool):
-    # creates an OFFER in response to a DISCOVER
-    reply = pkt.dhcp()
-    reply.add_option(pkt.DHCP.DHCPMsgTypeOption(p.OFFER_MSG))
+  def exec_release (self, event, p, subnet):
     src = event.parsed.src
+    port = event.port
+    dpid = event.connection.dpid
 
-    # if this host already has a lease
-    if src in self.leases:
-      offer = self.leases[src].ip   # offer it the same address
-      del self.leases[src]
-      self.offers[src] = offer      # move from leases to offers
+    if src != p.chaddr:
+      log.warn("%s tried to release %s with bad chaddr" % (src,p.ciaddr))
+      return
+    if self.leases[subnet].get(p.chaddr) != p.ciaddr:
+      log.warn("%s tried to release unleased %s" % (src,p.ciaddr))
+      return
+    ev = DHCPLease(src, LeaseEntry(p.chaddr), port, dpid, expire=True) # maybe change this ro release?
+    self.raiseEvent(ev)
+    del self.leases[subnet][p.chaddr]
+    pool.append(p.ciaddr)
 
-
-    # otherwise check if we already offered an address to this host
-    else:
-      offer = self.offers.get(src)
-      if offer is None:
-        if len(pool) == 0:
-          log.error("Out of IP addresses")
-          self.nak(event)
-          return
-
-        offer = pool[0] # offer the first available address
-        if p.REQUEST_IP_OPT in p.options: # if host requested specific address
-          wanted_ip = p.options[p.REQUEST_IP_OPT].addr
-          if wanted_ip in pool:
-            offer = wanted_ip
-        pool.remove(offer)
-        self.offers[src] = offer
-    reply.yiaddr = offer            # your IP
-    reply.siaddr = self.ip_addr     # server's IP
-
-    wanted_opts = set()
-    if p.PARAM_REQ_OPT in p.options:
-      wanted_opts.update(p.options[p.PARAM_REQ_OPT].options)
-    self.fill(wanted_opts, reply)
-
-    self.reply(event, reply)
-
-  def fill (self, wanted_opts, msg):
-    """
-    Fill out some options in msg
-    """
-    if msg.SUBNET_MASK_OPT in wanted_opts:
-      msg.add_option(pkt.DHCP.DHCPSubnetMaskOption(self.subnet))
-    if msg.ROUTERS_OPT in wanted_opts and self.router_addr is not None:
-      msg.add_option(pkt.DHCP.DHCPRoutersOption(self.router_addr))
-    if msg.DNS_SERVER_OPT in wanted_opts and self.dns_addr is not None:
-      msg.add_option(pkt.DHCP.DHCPDNSServersOption(self.dns_addr))
-    msg.add_option(pkt.DHCP.DHCPIPAddressLeaseTimeOption(self.lease_time))
-
-class DHCPD (EventMixin):
-  '''
-  DHCP Server that handles multiple subnets in the network.
-  '''
-  _eventMixin_events = set([DHCPLease])
-
-  def __init__(self, conf):
-      self.conf = conf
-      self.subnets = {}  # num -> DHCPServer
-      #self.mobile_hosts = {} # MAC -> IP
-      self.routers = [] # gateway IPs
-      self.central_switches = []
-
-      core.listen_to_dependencies(self, ['dynamic_topology'], short_attrs=True)
-
-  def _handle_dynamic_topology_StableEvent(self, event):
-    #TODO: allow dynamic updates to the YAML file if new switches
-    #      are added dynamically
-    if event.stable:
-      try:
-        with open(self.conf, 'r') as f:
-          config = yaml.load(f)
-          if config is None:
-            log.debug("Couldn't load server configuration")
-            return
-
-          log.debug('Loading DHCP server configuration from {0}...'.format(self.conf))
-
-          seen_switches = []
-
-          # look through subnets
-          for subnet in config:
-            if subnet[:6] == 'subnet':  # ignore random entries
-              num = int(subnet[6:])
-              if 'switches' not in config[subnet]: return
-              if 'net' not in config[subnet]: return
-              if 'router' not in config[subnet]: return
-              if 'dns' not in config[subnet]: return
-              if 'range' not in config[subnet]: return
-              if num in self.subnets:
-                log.debug("Ignoring duplicate subnet{0}".format(num))
-                return
-
-              ran = config[subnet].get('range')
-              first = 1
-              last = None
-              if ran is not None:
-                if len(ran) is 0:
-                  pass
-                elif len(ran) is 1:
-                  first = int(config[subnet]['range'][0])
-                elif len(ran) is 2:
-                  last = int(config[subnet]['range'][1])
-
-              switches = config[subnet]['switches']
-              seen_switches += [dpid_to_str(s) for s in switches]
-
-              pool = SimpleAddressPool(network = config[subnet]['net'],
-                                       first = first,
-                                       last = last)
-              static_hosts = config[subnet].get('static')
-              if static_hosts is not None:
-                  for sh in static_hosts:
-                      pool.remove(IPAddr(sh))
-              self.subnets[num] = DHCPServer(server=self,
-                                             ip_address=config[subnet]['router'],
-                                             router_address=(),
-                                             dns_address=config[subnet]['dns'],
-                                             pool=pool,
-                                             switches=switches)
-              self.routers.append(IPAddr(config[subnet]['router']))
-              log.info('{0} serves subnet {1} on switches {2}'.format(config[subnet]['router'],
-                                                                      config[subnet]['net'],
-                                                                      switches))
-              if static_hosts is not None:
-                  log.info('static hosts {0} on subnet {1}'.format(static_hosts,
-                                                                   config[subnet]['net']))
-              self.central_switches = [s for s in self.dynamic_topology.switches
-                                       if s not in seen_switches]
-      except:
-        log.debug('Error loading {0}'.format(self.conf))
+    log.debug("%s released %s" % (src,p.ciaddr))
 
   def get_subnet(self, ip_addr):
     '''
@@ -725,7 +694,7 @@ class DHCPD (EventMixin):
 
     subnet = [self.subnets[s] for s in self.subnets if ip_addr in self.subnets[s].pool.removed]
     if len(subnet) != 1:
-      raise RuntimeError("{0} is not on a valid subnet in this network".format(ip_addr))
+      raise RuntimeError("{0} is on {1} subnets".format(ip_addr, len(subnet)))
       return None
     subnet = subnet[0]
     network, subnet_mask = subnet.pool.network, subnet.pool.subnet_mask
@@ -737,32 +706,42 @@ class DHCPD (EventMixin):
     '''
 
     subnet = [self.subnets[s] for s in self.subnets if dpid in self.subnets[s].switches]
-    if len(subnet) != 1:
-      raise RuntimeError("{0} is not on a valid subnet in this network".format(dpid_str))
+    if len(subnet) is 1:
+      subnet = subnet[0]
+      network, subnet_mask = subnet.pool.network, subnet.pool.subnet_mask
+      return str(network) + '/' + str(subnet_mask)
+    else:
+      if len(subnet) > 1:
+        log.warn("{0} is on multiple subnets: {1}".format(dpid, subnet))
+      else:
+        log.warn("{0} is not on a subnet".format(dpid))
       return None
-    subnet = subnet[0]
-    network, subnet_mask = subnet.pool.network, subnet.pool.subnet_mask
-    return str(network) + '/' + str(subnet_mask)
 
   def is_router(self, ip_addr):
     '''
     Is this IP one of our router interfaces?
     '''
-    return ip_addr in self.routers
 
-  def is_central(self, dpid):
+    ip_addr = IPAddr(ip_addr)
+    match = [ip for ip in self.subnets.itervalues() if ip_addr == ip.server.addr]
+    return len(match) == 1
+
+  def is_core(self, dpid):
     '''
-    Does this DPID identify a central switch in our network?
+    Does this DPID identify a core switch in our network?
     '''
-    return (str(dpid) in self.central_switches)
+
+    return (dpid in self.core)
 
   def is_local_path(self, path):
     '''
     Is this traffic localized to one subnet?
     '''
-    central_switches = [node for node in path[1:-1] if node in self.central_switches]
+
+    core_switches = [node for node in path[1:-1] if node in self.core]
     return central_switches == []
 
-def launch (conf='dhcpd_conf.yaml'):
-  log.debug('Config: {0}'.format(conf))
-  core.register('dhcpd_multi', DHCPD(conf))
+
+# load DHCPDMulti
+def launch (networks = "192.168.0.0/24", dns = None):
+  core.register('dhcpd_multi', DHCPDMulti(networks, dns))
