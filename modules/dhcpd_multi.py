@@ -351,7 +351,8 @@ class DHCPDMulti (EventMixin):
 
   _eventMixin_events = set([DHCPLease])
 
-  def __init__(self, networks = "192.168.0.0/24", dns = None):
+  # constructor
+  def __init__ (self, network = "192.168.0.0/24", dns = None):
 
       # attributes of our network
       self.network, self.network_size = parse_cidr(network)
@@ -370,8 +371,10 @@ class DHCPDMulti (EventMixin):
       # if this is the first time the server has been started up
       self._first_stable = True
 
+      core.listen_to_dependencies(self)
       core.openflow.addListeners(self)
 
+  # server startup
   def _handle_ConnectionUp (self, event):
     '''
     When switches connect, install a flow rule to send all DHCP traffic
@@ -401,6 +404,7 @@ class DHCPDMulti (EventMixin):
           self._handle_dynamic_topology_DHCPEvent)
       log.info('connected to dynamic_topology')
 
+  # interacting with dynamic_topology
   def _handle_dynamic_topology_StableEvent(self, event):
     '''
     When the topology is stable, start the DHCP server.
@@ -441,48 +445,18 @@ class DHCPDMulti (EventMixin):
                                                                 core_switches[core]))
       self._first_stable = False
 
-  def _check_leases (self):
-    """
-    Checks for expired leases
-    """
-
-    for client in self.leases.keys():
-      lease = self.leases[client]
-      if lease.expired():
-        log.debug("Entry %s: IP address %s expired",
-                 str(client), str(lease.ip) )
-        self.pool.append(lease.ip)
-        ev = DHCPLease(client, lease, expire=True)
-        self.server.raiseEvent(ev)
-        del self.leases[client]
-        if ev._nak:
-          self.nak(event)
-          return
-
-  def _get_subnet (self, event):
-    """
-    Get a subnet for this event.
-
-    Return None to not issue a subnet.  You should probably log this.
-    """
-
-    subnet = [subnet for subnet in self.subnets
-              for switches in subnet if event.dpid in switches]
-    assert len(subnet) == 1
-    return subnet[0]
-
   def _handle_dynamic_topology_DHCPEvent (self, event):
     # Is it to us?  (Or at least not specifically NOT to us...)
     ipp = event.parsed.find('ipv4')
-    if ipp.dstip not in (IP_ANY, IP_BROADCAST) and
-       ipp.dstip not in self.core.values():
+    if (ipp.dstip not in (IP_ANY, IP_BROADCAST) and
+       ipp.dstip not in self.core.values()):
       return
 
     nwp = ipp.payload
     p = nwp.payload
     t = p.options.get(p.MSG_TYPE_OPT)
 
-    subnet = self._get_subnet(event)
+    subnet = self.get_event_subnet(event)
     if subnet is None:
       return
 
@@ -513,6 +487,30 @@ class DHCPDMulti (EventMixin):
       self.exec_release(event, p, subnet)
     return EventHalt
 
+  # verification that component is ready
+  def _all_dependencies_met (self):
+    log.info("dhcpd_multi ready")
+
+  # DHCP lease service routine
+  def _check_leases (self):
+    """
+    Checks for expired leases
+    """
+
+    for client in self.leases.keys():
+      lease = self.leases[client]
+      if lease.expired():
+        log.debug("Entry %s: IP address %s expired",
+                 str(client), str(lease.ip) )
+        self.pool.append(lease.ip)
+        ev = DHCPLease(client, lease, expire=True)
+        self.server.raiseEvent(ev)
+        del self.leases[client]
+        if ev._nak:
+          self.nak(event)
+          return
+
+  # helpers for sending DHCP packets
   def reply (self, event, subnet, msg):
 
     # fill out the rest of the DHCP packet
@@ -567,6 +565,7 @@ class DHCPDMulti (EventMixin):
       msg.add_option(pkt.DHCP.DHCPDNSServersOption(subnet.dns_addr))
     msg.add_option(pkt.DHCP.DHCPIPAddressLeaseTimeOption(self.lease_time))
 
+  # helpers for different stages in DHCP handshake
   def exec_discover (self, event, p, subnet):
     # creates an OFFER in response to a DISCOVER
     reply = pkt.dhcp()
@@ -687,7 +686,8 @@ class DHCPDMulti (EventMixin):
 
     log.debug("%s released %s" % (src,p.ciaddr))
 
-  def get_subnet(self, ip_addr):
+  # functions for determining subnet
+  def get_subnet (self, ip_addr):
     '''
     Given an IP, return the network address/subnet_mask.
     '''
@@ -700,7 +700,19 @@ class DHCPDMulti (EventMixin):
     network, subnet_mask = subnet.pool.network, subnet.pool.subnet_mask
     return str(network) + '/' + str(subnet_mask)
 
-  def get_switch_subnet(self, dpid):
+  def get_event_subnet (self, event):
+    """
+    Get a subnet for this event.
+
+    Return None to not issue a subnet.  You should probably log this.
+    """
+
+    subnet = [subnet for subnet in self.subnets
+              for switches in subnet if event.dpid in switches]
+    assert len(subnet) == 1
+    return subnet[0]
+
+  def get_switch_subnet (self, dpid):
     '''
     Given a switch, return the network address/subnet_mask it's on.
     '''
@@ -717,7 +729,8 @@ class DHCPDMulti (EventMixin):
         log.warn("{0} is not on a subnet".format(dpid))
       return None
 
-  def is_router(self, ip_addr):
+  # functions for identifying switches
+  def is_router (self, ip_addr):
     '''
     Is this IP one of our router interfaces?
     '''
@@ -726,14 +739,14 @@ class DHCPDMulti (EventMixin):
     match = [ip for ip in self.subnets.itervalues() if ip_addr == ip.server.addr]
     return len(match) == 1
 
-  def is_core(self, dpid):
+  def is_core (self, dpid):
     '''
     Does this DPID identify a core switch in our network?
     '''
 
     return (dpid in self.core)
 
-  def is_local_path(self, path):
+  def is_local_path (self, path):
     '''
     Is this traffic localized to one subnet?
     '''
@@ -743,5 +756,5 @@ class DHCPDMulti (EventMixin):
 
 
 # load DHCPDMulti
-def launch (networks = "192.168.0.0/24", dns = None):
-  core.register('dhcpd_multi', DHCPDMulti(networks, dns))
+def launch (network = "192.168.0.0/24", dns = None):
+  core.register('dhcpd_multi', DHCPDMulti(network, dns))

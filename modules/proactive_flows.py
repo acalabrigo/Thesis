@@ -22,9 +22,7 @@ import pox
 from networkx.algorithms.shortest_paths.generic import shortest_path
 
 log = core.getLogger()
-
 all_ports = of.OFPP_FLOOD
-
 GATEWAY_DUMMY_MAC = '03:00:00:00:be:ef'
 
 
@@ -51,7 +49,7 @@ class ProactiveFlows (object):
   def _all_dependencies_met (self):
     log.info("proactive_flows ready")
 
-  def _edge_reply(self, dst, node1, node2):
+  def _edge_reply (self, dst, node1, node2):
     '''
     Create a flow mod packet for an edge switch.
     '''
@@ -70,25 +68,25 @@ class ProactiveFlows (object):
 
     self.dynamic_topology.graph.node[node1]['connection'].send(msg)
 
-    def _edge_reply_local(self, dst, node1, node2):
-      '''
-      Create a flow mod packet for an edge switch for l2 traffic within the
-      subnet.
-      '''
+  def _edge_reply_local (self, dst, node1, node2):
+    '''
+    Create a flow mod packet for an edge switch for l2 traffic within the
+    subnet.
+    '''
 
-      msg = of.ofp_flow_mod()
-      msg.match.dl_dst = dst
-      port = self.dynamic_topology.get_link_port(node1, node2)
+    msg = of.ofp_flow_mod()
+    msg.match.dl_dst = dst
+    port = self.dynamic_topology.get_link_port(node1, node2)
 
-      if port is None:
-        log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
-        return
-      else:
-        msg.idle_timeout = self.idle_timeout
-        msg.actions.append(of.ofp_action_output(port = port))
+    if port is None:
+      log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
+      return
+    else:
+      msg.idle_timeout = self.idle_timeout
+      msg.actions.append(of.ofp_action_output(port = port))
 
-      self.dynamic_topology.graph.node[node1]['connection'].send(msg)
-      log.debug("Installing local L2 flow %s <-> %s" % (packet.src, packet.dst))
+    self.dynamic_topology.graph.node[node1]['connection'].send(msg)
+    log.debug("Installing local L2 flow %s <-> %s" % (packet.src, packet.dst))
 
   def _core_reply(self, dst, node1, node2, mobile=False):
     '''
@@ -287,6 +285,6 @@ class ProactiveFlows (object):
       return
 
 
-def launch(idle_timeout=300):
+def launch (idle_timeout=300):
   if not core.hasComponent("proactive_flows"):
     core.register("proactive_flows", ProactiveFlows(int(idle_timeout)))

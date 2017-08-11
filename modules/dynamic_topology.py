@@ -30,6 +30,20 @@ from networkx.algorithms.shortest_paths.generic import shortest_path
 
 log = core.getLogger()
 
+# Times (in seconds) to use for differente timouts:
+timeoutSec = dict(
+  arpAware=30,   # Quiet ARP-responding entries are pinged after this
+  arpSilent=60*20, # This is for quiet entries not known to answer ARP
+  arpReply=4,      # Time to wait for an ARP reply before retrial
+  timerInterval=5, # Seconds between timer routine activations
+  entryMove=1     # Minimum expected time to move a physical entry
+  )
+
+# Address to send ARP pings from.
+# The particular one here is just an arbitrary locally administered address.
+DEFAULT_ARP_PING_SRC_MAC = '02:00:00:00:be:ef'
+
+
 # from host_tracker.py
 class Alive (object):
   """
@@ -109,7 +123,7 @@ class Host (Alive):
     self.macaddr = macaddr
     self.ipaddr = None
 
-  def __str__(self):
+  def __str__ (self):
     return ' '.join([str(self.dpid), str(self.port), str(self.macaddr)])
 
   def __eq__ (self, other):
@@ -135,7 +149,7 @@ class StableEvent (Event):
   predetermined interval of time.
   '''
 
-  def __init__(self, stable, graph):
+  def __init__ (self, stable, graph):
     super(StableEvent, self).__init__();
     self.stable = stable
     self.graph = graph
@@ -146,7 +160,7 @@ class DHCPEvent (Event):
   Event when the topology receives a DHCP packet.
   '''
 
-  def __init__(self, graph):
+  def __init__ (self, graph):
     super(DHCPEvent, self).__init__();
     self.graph = graph
 
@@ -160,7 +174,9 @@ class DynamicTopology (EventMixin):
 
   _eventMixin_events = set([StableEvent, DHCPEvent])
 
-  def __init__ (self, debug = False, check_interval = 5.0, eat_packets = True):
+  # constructor
+  def __init__ (self, debug = False, check_interval = 5.0, ping_src_mac = None,
+                eat_packets = True):
     # the graph of the network
     self.graph = nx.Graph()
 
@@ -258,7 +274,7 @@ class DynamicTopology (EventMixin):
         ip_addr, ip_address = host.ipaddr.ip, host.ipaddr
         if ip_address.expired():
           if ip_address.pings.failed():
-              ip_addr = str(ip_addr)
+            ip_addr = str(ip_addr)
             ip_address = None
             log.debug("Host %s: IP address %s expired",
                       str(host), ip_addr)
@@ -278,6 +294,10 @@ class DynamicTopology (EventMixin):
         self.raiseEventNoErrors(HostEvent, host, old_ip=ip_addr,
                                 old_mac=host.macaddr, leave=True)
         self.update_host(host, leave=True)
+
+  # verification that component is ready
+  def _all_dependencies_met (self):
+    log.info("dynamic_topology ready")
 
   # Switch management
   def _handle_openflow_ConnectionUp (self, event):
@@ -339,7 +359,7 @@ class DynamicTopology (EventMixin):
 
     self.stable, self.last_check = False, time.time()
 
-  def is_edge_port(self, dpid, inport):
+  def is_edge_port (self, dpid, inport):
     '''
     Returns true if the given port on the given switch is not connected to
     another switch.
@@ -352,8 +372,8 @@ class DynamicTopology (EventMixin):
       edge_info = self.graph[dpid][node]
       if 'link' in edge_info:
         link = edge_info['link']
-        if (link.dpid1 == dpid and link.port1 == inport) or
-          (link.dpid2 == dpid and link.port2 == inport):
+        if ((link.dpid1 == dpid and link.port1 == inport) or
+          (link.dpid2 == dpid and link.port2 == inport)):
           return False
     return True
 
@@ -439,7 +459,7 @@ class DynamicTopology (EventMixin):
       host.refresh()
       log.info('{0} joined on {1} port {2}'.format(host.macaddr, dpid, port))
 
-  def get_host_info(self, ip):
+  def get_host_info (self, ip):
     '''
     Allows us to look up host MAC addresses by IP address, like
     what ARP does.
@@ -640,6 +660,6 @@ class DynamicTopology (EventMixin):
 
 
 # launch DynamicTopology
-def launch(debug="False"):
+def launch (debug="False"):
     if not core.hasComponent("dynamic_topology"):
         core.register("dynamic_topology", DynamicTopology(str_to_bool(debug)))
