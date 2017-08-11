@@ -250,7 +250,7 @@ class DynamicTopology (EventMixin):
     """
 
     for host in [node for node in self.graph.nodes(data=True)
-                 if 'info' in node[1]:
+                 if 'info' in node[1]]:
       # host[0] is the MAC and host[1] is the dict of attributes
       entry_pinged = False
       host = host[1]['info']
@@ -370,7 +370,7 @@ class DynamicTopology (EventMixin):
       return link.port1
     else:
       return link.port2
-  
+
   # Host management
   def delete_host_flows (self, ip, mac):
 

@@ -23,7 +23,7 @@ import dynamic_topology
 import dhcpd_multi
 import proactive_flows
 
-def launch(debug="False", conf='dhcpd_conf.yaml'):
+def launch(debug="False"):
   pox.topology.launch()
   pox.openflow.discovery.launch()
   dynamic_topology.launch(debug)
