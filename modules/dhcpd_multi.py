@@ -24,7 +24,7 @@ import pox.openflow.libopenflow_01 as of
 import pox.lib.packet as pkt
 from pox.lib.packet.arp import arp
 from pox.lib.packet.ethernet import ethernet
-from pox.lib.addresses import IPAddr,EthAddr,parse_cidr
+from pox.lib.addresses import IPAddr,EthAddr,parse_cidr,cidr_to_netmask
 from pox.lib.addresses import IP_BROADCAST, IP_ANY
 from pox.lib.revent import *
 from pox.lib.util import dpid_to_str
@@ -283,16 +283,15 @@ class DHCPLease (Event):
   Call nak() to abort this lease
   """
 
-  def __init__ (self, host_mac, ip_entry, port=None,
+  def __init__ (self, host_mac, ip, port=None,
                 dpid=None, renew=False, expire=False):
     super(DHCPLease, self).__init__()
-    self.host_mac = host_mac
-    self.ip = ip_entry.ip
+    self.mac = host_mac
+    self.ip = ip
     self.port = port
     self.dpid = dpid
     self.renew = renew
     self.expire = expire
-    self.is_mobile = is_mobile
     self._nak = False
 
     assert sum(1 for x in [renew, expire] if x) == 1
@@ -310,7 +309,7 @@ class Subnet (object):
   really just a dummy address.
   '''
 
-  def __init__ (self, network, pool, switches, server, dns = None):
+  def __init__ (self, network, pool, switches, server, dns = None, subnet = None):
 
     def fix_addr (addr, backup):
       if addr is None: return None
@@ -326,7 +325,7 @@ class Subnet (object):
       self.subnet = IPAddr(subnet or "255.255.255.0")
     else:
       self.pool = pool
-      self.subnet = subnet
+      self.subnet = cidr_to_netmask(subnet)
       if hasattr(pool, 'subnet_mask'):
         self.subnet = pool.subnet_mask
       if self.subnet is None:
@@ -336,8 +335,8 @@ class Subnet (object):
     self.address_pool = pool
     self.switches = switches
 
-    assert isinstance(server, (int, IPAddr))
-    self.server = Server(server) # (dpid, ipaddr)
+    assert isinstance(server, tuple)
+    self.server = server # (dpid, ipaddr)
 
     if self.server.addr in self.pool:
       log.debug("Removing my own IP (%s) from address pool", self.server.addr)
@@ -365,8 +364,7 @@ class DHCPDMulti (EventMixin):
       self.lease_time = timeoutSec['leaseInterval']
       self.offers = {} # Subnet -> {Eth -> IP we offered}
       self.leases = {} # Subnet -> {Eth -> LeaseEntry}
-      self._t = Timer(timeoutSec['timerInterval'], self._check_leases,
-                      recurring=True)
+      self._t = None
 
       # if this is the first time the server has been started up
       self._first_stable = True
@@ -399,13 +397,12 @@ class DHCPDMulti (EventMixin):
 
     if event.name == "dynamic_topology":
       event.component.addListenerByName("StableEvent",
-          self._handle_dynamic_topology_StableEvent)
-      event.component.addListenerByName("DHCPEvent",
-          self._handle_dynamic_topology_DHCPEvent)
+          self._dynamic_topology_stable)
+      event.component.addListenerByName("DHCPEvent", self._dhcp_PacketIn)
       log.info('connected to dynamic_topology')
 
   # interacting with dynamic_topology
-  def _handle_dynamic_topology_StableEvent(self, event):
+  def _dynamic_topology_stable (self, event):
     '''
     When the topology is stable, start the DHCP server.
     '''
@@ -428,24 +425,35 @@ class DHCPDMulti (EventMixin):
                            graph, source=switch, target=x)))
         core_switches[closest_core].append(switch)
 
-      for core,i in enumerate(core_switches):
-        network_addr = IPAddr(self.network) | (i << (32 - self.network_size))
-        server_addr = network_addr + 1
+      for i,c in enumerate(core):
+        network_addr = IPAddr(self.network).toUnsigned() | (i << (32 - self.network_size))
+        server_addr = IPAddr(network_addr + 1)
         core_ips.append(server_addr)
-        pool = SimpleAddressPool(str(network_addr) + '/' + self.network_size)
-        subnet = Subnet(ip_address = server_addr, pool = pool,
-                        switches = core_switches[core], server = (core, server_addr),
-                        dns = self.dns_addr)
+        network_addr = IPAddr(network_addr)
+        pool = SimpleAddressPool(str(network_addr) + '/' + str(self.network_size))
+        subnet = Subnet(network = server_addr, pool = pool,
+                        switches = core_switches[c], server = Server(c, server_addr),
+                        dns = self.dns_addr, subnet = self.network_size)
         self.subnets[server_addr] = subnet
         self.leases[subnet] = {}
         self.offers[subnet] = {}
-        self.core = dict(zip(core, core_ips))
         log.info('{0} serves subnet {1} on switches {2}'.format(server_addr,
                                                                 network_addr,
-                                                                core_switches[core]))
-      self._first_stable = False
+                                                                core_switches[c]))
 
-  def _handle_dynamic_topology_DHCPEvent (self, event):
+      self.core = dict(zip(core, core_ips))
+      self._first_stable = False
+      self._t = Timer(timeoutSec['timerInterval'], self._check_leases,
+                      recurring=True)
+
+  def _dhcp_PacketIn (self, event):
+    '''
+    Topology has passed us a PacketIn with DHCP contents, let's handle it.
+    '''
+
+    graph = event.graph
+    event = event.packetin
+
     # Is it to us?  (Or at least not specifically NOT to us...)
     ipp = event.parsed.find('ipv4')
     if (ipp.dstip not in (IP_ANY, IP_BROADCAST) and
@@ -462,7 +470,7 @@ class DHCPDMulti (EventMixin):
 
     # ALL mobility checking done here!
     src = event.parsed.src
-    host = event.graph.node[src]
+    host = graph.node[src]
     if host is not None:
       ip_addr = host['info'].ipaddr
       if ip_addr is not None:
@@ -497,18 +505,19 @@ class DHCPDMulti (EventMixin):
     Checks for expired leases
     """
 
-    for client in self.leases.keys():
-      lease = self.leases[client]
-      if lease.expired():
-        log.debug("Entry %s: IP address %s expired",
-                 str(client), str(lease.ip) )
-        self.pool.append(lease.ip)
-        ev = DHCPLease(client, lease, expire=True)
-        self.server.raiseEvent(ev)
-        del self.leases[client]
-        if ev._nak:
-          self.nak(event)
-          return
+    for subnet in self.subnets.itervalues():
+      leases = self.leases[subnet]
+      for client in leases.keys():
+        lease = leases[client]
+        if lease.expired():
+          log.debug("Entry %s: IP address %s expired",
+                    str(client), str(lease.ip) )
+          subnet.pool.append(lease.ip)
+          ev = DHCPLease(client, lease.ip, expire=True)
+          self.raiseEvent(ev)
+          del leases[client]
+          if ev._nak:
+            self.nak(event)
 
   # helpers for sending DHCP packets
   def reply (self, event, subnet, msg):
@@ -648,12 +657,12 @@ class DHCPDMulti (EventMixin):
 
     assert got_ip == wanted_ip
     self.leases[subnet][src] = got_ip
-    ev = DHCPLease(src, got_ip, port, dpid, renew=True)
+    ev = DHCPLease(src, got_ip.ip, port, dpid, renew=True)
+    log.info("%s leased %s to %s" % (subnet.server.addr, got_ip, src))
     self.raiseEvent(ev)
     if ev._nak:
       self.nak(event, subnet)
       return
-    log.debug("%s leased %s to %s" % (subnet.server.addr, got_ip, src))
 
     # create ack reply
     reply = pkt.dhcp()
@@ -679,7 +688,8 @@ class DHCPDMulti (EventMixin):
     if self.leases[subnet].get(p.chaddr) != p.ciaddr:
       log.warn("%s tried to release unleased %s" % (src,p.ciaddr))
       return
-    ev = DHCPLease(src, LeaseEntry(p.chaddr), port, dpid, expire=True) # maybe change this ro release?
+    ev = DHCPLease(src, p.chaddr, port, dpid, expire=True)
+    log.info("%s released %s from %s" % (subnet.server.addr, p.ciaddr, src))
     self.raiseEvent(ev)
     del self.leases[subnet][p.chaddr]
     pool.append(p.ciaddr)
@@ -707,8 +717,8 @@ class DHCPDMulti (EventMixin):
     Return None to not issue a subnet.  You should probably log this.
     """
 
-    subnet = [subnet for subnet in self.subnets
-              for switches in subnet if event.dpid in switches]
+    subnet = [self.subnets[s] for s in self.subnets
+              if event.dpid in self.subnets[s].switches]
     assert len(subnet) == 1
     return subnet[0]
 

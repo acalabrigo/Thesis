@@ -11,6 +11,8 @@ import pox.openflow.libopenflow_01 as of
 import pox.lib.packet as pkt
 from pox.lib.packet.arp import arp
 from pox.lib.packet.ethernet import ethernet
+from pox.lib.packet.ipv4 import ipv4
+from pox.lib.packet.dhcp import dhcp
 from pox.lib.addresses import IPAddr,EthAddr,parse_cidr
 from pox.lib.addresses import IP_BROADCAST, IP_ANY
 import pox.openflow.discovery as discovery
@@ -124,7 +126,11 @@ class Host (Alive):
     self.ipaddr = None
 
   def __str__ (self):
-    return ' '.join([str(self.dpid), str(self.port), str(self.macaddr)])
+    if self.ipaddr is not None:
+      return ' '.join([str(self.dpid), str(self.port), str(self.macaddr),
+                       str(self.ipaddr.ip)])
+    else:
+      return ' '.join([str(self.dpid), str(self.port), str(self.macaddr), 'no IP'])
 
   def __eq__ (self, other):
     if other is None:
@@ -160,8 +166,9 @@ class DHCPEvent (Event):
   Event when the topology receives a DHCP packet.
   '''
 
-  def __init__ (self, graph):
+  def __init__ (self, packetin, graph):
     super(DHCPEvent, self).__init__();
+    self.packetin = packetin
     self.graph = graph
 
 
@@ -191,6 +198,7 @@ class DynamicTopology (EventMixin):
     if eat_packets:
       listen_args={'openflow':{'priority':1}}
     core.listen_to_dependencies(self, listen_args=listen_args)
+    core.dhcpd_multi.addListenerByName("DHCPLease", self._dhcp_lease)
 
     # debug printouts
     self.debug = debug
@@ -270,7 +278,7 @@ class DynamicTopology (EventMixin):
       # host[0] is the MAC and host[1] is the dict of attributes
       entry_pinged = False
       host = host[1]['info']
-      if host_info.ipaddr is not None:
+      if host.ipaddr is not None:
         ip_addr, ip_address = host.ipaddr.ip, host.ipaddr
         if ip_address.expired():
           if ip_address.pings.failed():
@@ -280,19 +288,17 @@ class DynamicTopology (EventMixin):
                       str(host), ip_addr)
           else:
             self.sendPing(host, ip_addr)
-            ipEntry.pings.sent()
+            ip_address.pings.sent()
             entry_pinged = True
       else:
         ip_addr = None
       if host.expired() and not entry_pinged:
-        log.debug("Entry %s expired", str(host))
-        # sanity check: there should be no IP address left
+        log.info("Entry %s expired", str(host))
+
         if host.ipaddr is not None:
           log.warning("Entry %s expired but still had IP address %s",
                       str(host), str(ip_addr) )
           host.ipaddr = None
-        self.raiseEventNoErrors(HostEvent, host, old_ip=ip_addr,
-                                old_mac=host.macaddr, leave=True)
         self.update_host(host, leave=True)
 
   # verification that component is ready
@@ -344,7 +350,7 @@ class DynamicTopology (EventMixin):
     s1 = event.link.dpid1
     s2 = event.link.dpid2
 
-    if s1 not in self.graph.nodes() or s2 not in self.graph.nodes():
+    if s1 not in self.graph or s2 not in self.graph:
       if event not in self.waiting_links:
         self.waiting_links.append(event)
       return
@@ -352,7 +358,8 @@ class DynamicTopology (EventMixin):
     if event.added:
       self.graph.add_edge(s1, s2, link=event.link)
     elif event.removed:
-      self.graph.remove_edge(s1, s2)
+      if self.graph.has_edge(s1, s2):
+        self.graph.remove_edge(s1, s2)
 
     if event in self.waiting_links:
       self.waiting_links.remove(event)
@@ -384,12 +391,22 @@ class DynamicTopology (EventMixin):
     '''
 
     assert dst_dpid in self.graph.neighbors(src_dpid)
-    link = self.graph[src_dpid][dst_dpid]['link']
 
-    if src_dpid == link.dpid1:
-      return link.port1
+    edge = self.graph[src_dpid][dst_dpid]
+
+    # if switch - switch link
+    if 'link' in edge:
+      link = edge['link']
+      if src_dpid == link.dpid1:
+        return link.port1
+      else:
+        return link.port2
+
+    # if host - switch link
+    elif 'port' in edge:
+      return edge['port']
     else:
-      return link.port2
+      return None
 
   # Host management
   def delete_host_flows (self, ip, mac):
@@ -424,7 +441,7 @@ class DynamicTopology (EventMixin):
     '''
     When mobile_host_tracker generates HostEvents, then a host has
     joined/left/moved around the network. Use these events to
-    add hosts to the graph.
+    add hosts to the graph. Expects a host object as host.
     '''
 
     assert sum(1 for x in [join,leave,move] if x) == 1
@@ -433,8 +450,8 @@ class DynamicTopology (EventMixin):
       if host.macaddr in self.graph:
         if host.ipaddr is not None:
           self.delete_host_flows(host.ipaddr.ip, host.macaddr)
+        log.info('{0} left'.format(str(host)))
         self.graph.remove_node(host.macaddr)
-        log.info('{0} --> {1} left'.format(host.macaddr, host.ipaddr.ip))
 
     elif move:
       assert new is not None
@@ -447,17 +464,17 @@ class DynamicTopology (EventMixin):
       # host ports not factored in
       self.graph.add_edge(new.dpid, host.macaddr, port=new.port)
       log.info('{0} moved from {1} port {2} --> {3} port {4}'.format(
-        host.macaddr, dpid, host.port, new.dpid, new.port))
+        host.macaddr, host.dpid, host.port, new.dpid, new.port))
       host.dpid = new.dpid
       host.port = new.port
       host.refresh()
 
     else: # join
       self.graph.add_node(host.macaddr)
-      self.graph.add_edge(dpid, host.macaddr, port=host.port)
+      self.graph.add_edge(host.dpid, host.macaddr, port=host.port)
       self.graph.node[host.macaddr]['info'] = host
       host.refresh()
-      log.info('{0} joined on {1} port {2}'.format(host.macaddr, dpid, port))
+      log.info('{0} joined on {1} port {2}'.format(host.macaddr, host.dpid, host.port))
 
   def get_host_info (self, ip):
     '''
@@ -465,11 +482,11 @@ class DynamicTopology (EventMixin):
     what ARP does.
     '''
 
-    # NOTE: new code
-
     hosts = [node for node in self.graph.nodes(data=True)
-            if 'info' in node[1] and node[1]['info'].ip == ip]
-    if len(hosts) == 1:
+            if 'info' in node[1] and node[1]['info'].ipaddr is not None and
+            node[1]['info'].ipaddr.ip == ip]
+
+    if len(hosts) is 1:
       return hosts[0][1]['info']
     elif len(hosts) > 1:
       log.warn("found multiple hosts with IP {0}".format(ip))
@@ -489,14 +506,8 @@ class DynamicTopology (EventMixin):
 
     dpid = event.connection.dpid
     inport = event.port
-    #subnet = self.dhcpd_multi.get_switch_subnet(dpid) # get the subnet of this switch
-
-    # if this is DHCP, raise event for DHCP server and halt event
-    if self.is_dhcp(event):
-      self.raiseEventNoErrors(DHCPEvent(event, self.graph))
-      return EventHalt
-
     packet = event.parsed
+
     if not packet.parsed:
       log.warning("%i %i ignoring unparsed packet", dpid, inport)
       return
@@ -509,38 +520,49 @@ class DynamicTopology (EventMixin):
       log.debug("%i %i ignoring packetIn at switch-only port", dpid, inport)
       return
 
-    if packet.find('dhcp') is not None:
-      # leave this to DHCP lease events
-      return
-
     log.debug("PacketIn: %i %i ETH %s => %s",
               dpid, inport, str(packet.src), str(packet.dst))
 
     # Learn or update dpid/port/MAC info
     host = (packet.src in self.graph)
-    move = False
 
     if host:
       host = self.graph.node[packet.src]['info']
+      host.refresh()
 
     if not host:
       host = Host(dpid,inport,packet.src)
-      self.host_update(host, join = True)
+      self.update_host(host, join = True)
 
     elif host != (dpid, inport, packet.src):
-      self.host_update(host, move = True, new = New(dpid, inport))
-      move = True
+      self.update_host(host, move = True, new = New(dpid, inport))
 
     (pckt_srcip, hasARP) = self.getSrcIPandARP(packet.next)
     if pckt_srcip is not None and pckt_srcip != '0.0.0.0':
       self.updateIPInfo(pckt_srcip, host, hasARP)
 
-    #if move and host.ipaddr is not None:
-    #    if (not on_subnet(host.ipaddr.ip, subnet)):
-    #      self.dynamic_topology.host_is_mobile(host.macaddr, True)
+    host.refresh()
+
+    # if this is DHCP, raise event for DHCP server and halt event
+    if self.is_dhcp(event):
+      self.raiseEventNoErrors(DHCPEvent(event, self.graph))
+      return EventHalt
 
     if self.eat_packets and packet.dst == self.ping_src_mac:
       return EventHalt
+
+  def _dhcp_lease (self, event):
+    '''
+    Adjust Host IP information according to DHCP lease renews/expires.
+    '''
+
+    host = self.graph.node[event.mac]['info']
+
+    if event.renew:
+      self.updateIPInfo(event.ip, host, True)
+    else:
+      host.ipaddr = None
+      log.info("learned %s lost IP %s", str(event.mac), str(event.ip))
 
   def is_dhcp (self, event):
     '''
@@ -622,12 +644,12 @@ class DynamicTopology (EventMixin):
       ipEntry = host.ipaddr
       ipEntry.refresh()
       log.debug("%s already has IP %s, refreshing",
-                str(host), str(pckt_srcip))
+                str(host.macaddr), str(pckt_srcip))
     else:
       # new mapping
       ipEntry = IPAddress(hasARP, pckt_srcip)
       host.ipaddr = ipEntry
-      log.debug("Learned %s got IP %s", str(host), str(pckt_srcip))
+      log.info("learned %s got IP %s", str(host.macaddr), str(pckt_srcip))
     if hasARP:
       ipEntry.pings.received()
 
@@ -655,7 +677,7 @@ class DynamicTopology (EventMixin):
       # host is stale, remove it.
       log.debug("%i %i ERROR sending ARP REQ to %s %s",
                 host.dpid, host.port, str(r.hwdst), str(r.protodst))
-      del host.ipaddrs[ipaddr]
+      del host.ipaddr[ipaddr]
     return
 
 

@@ -26,6 +26,6 @@ import proactive_flows
 def launch (debug="False"):
   pox.topology.launch()
   pox.openflow.discovery.launch()
-  dynamic_topology.launch(debug)
   dhcpd_multi.launch()
+  dynamic_topology.launch(debug)
   proactive_flows.launch()
