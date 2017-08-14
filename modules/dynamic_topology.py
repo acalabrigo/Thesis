@@ -532,9 +532,11 @@ class DynamicTopology (EventMixin):
     if not host:
       host = Host(dpid,inport,packet.src)
       self.update_host(host, join = True)
+      change = True
 
     elif host != (dpid, inport, packet.src):
       self.update_host(host, move = True, new = New(dpid, inport))
+      change = True
 
     (pckt_srcip, hasARP) = self.getSrcIPandARP(packet.next)
     if pckt_srcip is not None and pckt_srcip != '0.0.0.0':

@@ -358,7 +358,7 @@ class DHCPDMulti (EventMixin):
       self.dns_addr = dns
       self.subnets = {}  # IP -> subnet
       self.core = {} # dpid -> IP
-      self.mobile_hosts = [] # macs
+      self.mobile_hosts = [] # IPs
 
       # attributes to track DHCP
       self.lease_time = timeoutSec['leaseInterval']
@@ -480,15 +480,15 @@ class DHCPDMulti (EventMixin):
                           in self.subnets[s].pool.removed]
         assert len(home_subnet) is 1
         home_subnet = home_subnet[0]
-        if home_subnet != subnet and src not in self.mobile_hosts:
+        if home_subnet != subnet and ip_addr not in self.mobile_hosts:
           log.info('{0} moved from {1} to {2}, is now mobile with {3}'.format(
                    src, home_subnet.server.addr, subnet.server.addr, ip_addr))
           subnet = home_subnet
-          self.mobile_hosts.append(src)
-        elif home_subnet == subnet and src in self.mobile_hosts:
+          self.mobile_hosts.append(ip_addr)
+        elif home_subnet == subnet and ip_addr in self.mobile_hosts:
           log.info('{0} moved from {1} to {2}, is now back on home subnet with {3}'.format(
                    src, home_subnet.server.addr, subnet.server.addr, ip_addr))
-          self.mobile_hosts.remove(src)
+          self.mobile_hosts.remove(ip_addr)
 
     if t.type == p.DISCOVER_MSG:
       self.exec_discover(event, p, subnet)

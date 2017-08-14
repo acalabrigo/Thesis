@@ -21,6 +21,8 @@ import pox
 # networkX
 from networkx.algorithms.shortest_paths.generic import shortest_path
 
+import time
+
 log = core.getLogger()
 all_ports = of.OFPP_FLOOD
 GATEWAY_DUMMY_MAC = '03:00:00:00:be:ef'
@@ -125,7 +127,7 @@ class ProactiveFlows (object):
 
     packet = event.parsed
     dpid = event.connection.dpid
-
+    t = time.time()
     if not packet.parsed:
       return
     if packet.type == ethernet.LLDP_TYPE: # Ignore LLDP packets
@@ -195,7 +197,7 @@ class ProactiveFlows (object):
         msg.data = event.ofp
         msg.in_port = event.port
         event.connection.send(msg)
-
+        
     # CASE 2: the switch gets an ARP request from a host. In this case,
     # create an ARP reply based on the known network topology. Send this
     # back out the input port on the switch.
@@ -281,7 +283,6 @@ class ProactiveFlows (object):
           device = path[i]
           self._edge_reply_local(dst, device, path[i + 1])
           self._edge_reply_local(src, device, path[i - 1])
-
       return
 
 
