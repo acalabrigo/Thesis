@@ -409,7 +409,8 @@ class DHCPDMulti (EventMixin):
 
     graph = event.graph
     if event.stable and self._first_stable:
-      core = find_cliques(graph).next()
+      cliques = find_cliques(graph)
+      core = max(cliques, key=lambda x: len(x))
       core_ips = []
 
       if core is None:
@@ -470,7 +471,7 @@ class DHCPDMulti (EventMixin):
 
     # ALL mobility checking done here!
     src = event.parsed.src
-    host = graph.node[src]
+    host = graph.node[str(src)]
     if host is not None:
       ip_addr = host['info'].ipaddr
       if ip_addr is not None:
@@ -485,6 +486,8 @@ class DHCPDMulti (EventMixin):
           subnet = home_subnet
           self.mobile_hosts.append(src)
         elif home_subnet == subnet and src in self.mobile_hosts:
+          log.info('{0} moved from {1} to {2}, is now back on home subnet with {3}'.format(
+                   src, home_subnet.server.addr, subnet.server.addr, ip_addr))
           self.mobile_hosts.remove(src)
 
     if t.type == p.DISCOVER_MSG:

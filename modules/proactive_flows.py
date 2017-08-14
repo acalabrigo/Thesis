@@ -159,7 +159,7 @@ class ProactiveFlows (object):
       # retrieve graph info, find shortest path between devices
       #log.info("{0} Looking for path from {1} to {2}".format(dpid, packet.src, true_dst))
       graph = self.dynamic_topology.graph
-      path = shortest_path(graph, packet.src, true_dst)
+      path = shortest_path(graph, str(packet.src), str(true_dst))
 
       if path is not None:
         log.debug("path found: {0}".format(path))
@@ -265,7 +265,7 @@ class ProactiveFlows (object):
       if dst in self.dynamic_topology.graph:
         log.debug("{0} Looking for path from {1} to {2}".format(dpid, src, dst))
         graph = self.dynamic_topology.graph
-        path = shortest_path(graph, src, dst)
+        path = shortest_path(graph, str(src), str(dst))
 
         if path is not None:
           log.debug("Path found: {0}".format(path))
