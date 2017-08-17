@@ -309,7 +309,8 @@ class Subnet (object):
   really just a dummy address.
   '''
 
-  def __init__ (self, network, pool, switches, server, dns = None, subnet = None):
+  def __init__ (self, network, pool, switches, vlans, server,
+                dns = None, subnet = None):
 
     def fix_addr (addr, backup):
       if addr is None: return None
@@ -334,6 +335,7 @@ class Subnet (object):
 
     self.address_pool = pool
     self.switches = switches
+    self.vlans = vlans # {switch : vlan}
 
     assert isinstance(server, tuple)
     self.server = server # (dpid, ipaddr)
@@ -419,7 +421,7 @@ class DHCPDMulti (EventMixin):
 
       core_switches = {s:[] for s in core}
       not_core = [node for node in graph if node not in core and
-                  not isinstance(node, EthAddr)]
+                  not isinstance(node, str)]
 
       for switch in not_core:
         closest_core = min(core, key=lambda x: len(shortest_path(
@@ -465,7 +467,7 @@ class DHCPDMulti (EventMixin):
     p = nwp.payload
     t = p.options.get(p.MSG_TYPE_OPT)
 
-    subnet = self.get_event_subnet(event)
+    subnet = self.get_event_subnet(event.dpid)
     if subnet is None:
       return
 
@@ -480,11 +482,12 @@ class DHCPDMulti (EventMixin):
                           in self.subnets[s].pool.removed]
         assert len(home_subnet) is 1
         home_subnet = home_subnet[0]
-        if home_subnet != subnet and ip_addr not in self.mobile_hosts:
+        if home_subnet != subnet:
           log.info('{0} moved from {1} to {2}, is now mobile with {3}'.format(
                    src, home_subnet.server.addr, subnet.server.addr, ip_addr))
           subnet = home_subnet
-          self.mobile_hosts.append(ip_addr)
+          if ip_addr not in self.mobile_hosts:
+            self.mobile_hosts.append(ip_addr)
         elif home_subnet == subnet and ip_addr in self.mobile_hosts:
           log.info('{0} moved from {1} to {2}, is now back on home subnet with {3}'.format(
                    src, home_subnet.server.addr, subnet.server.addr, ip_addr))
@@ -496,6 +499,7 @@ class DHCPDMulti (EventMixin):
       self.exec_request(event, p, subnet)
     elif t.type == p.RELEASE_MSG:
       self.exec_release(event, p, subnet)
+
     return EventHalt
 
   # verification that component is ready
@@ -642,7 +646,7 @@ class DHCPDMulti (EventMixin):
     if got_ip is None:
       if src in self.offers[subnet]:    # if there was an offer to this client
         if wanted_ip != self.offers[subnet][src]:
-          pool.append(self.offers[subnet][src])
+          subnet.pool.append(self.offers[subnet][src])
           del self.offers[subnet][src]
         else:
           got_ip = LeaseEntry(self.offers[subnet][src])
@@ -713,15 +717,15 @@ class DHCPDMulti (EventMixin):
     network, subnet_mask = subnet.pool.network, subnet.pool.subnet_mask
     return str(network) + '/' + str(subnet_mask)
 
-  def get_event_subnet (self, event):
+  def get_event_subnet (self, dpid):
     """
-    Get a subnet for this event.
+    Get a subnet for this switch.
 
     Return None to not issue a subnet.  You should probably log this.
     """
 
     subnet = [self.subnets[s] for s in self.subnets
-              if event.dpid in self.subnets[s].switches]
+              if dpid in self.subnets[s].switches]
     assert len(subnet) == 1
     return subnet[0]
 
@@ -741,6 +745,19 @@ class DHCPDMulti (EventMixin):
       else:
         log.warn("{0} is not on a subnet".format(dpid))
       return None
+
+  def on_home_subnet (self, dpid, ip_addr):
+    '''
+    Given a host IP and the dpid of a switch, determine if that switch is
+    on the hosts home subnet.
+    '''
+
+    current_subnet = self.get_event_subnet(dpid)
+    home_subnet = [self.subnets[s] for s in self.subnets if ip_addr
+                   in self.subnets[s].pool.removed]
+    assert len(home_subnet) is 1
+    home_subnet = home_subnet[0]
+    return home_subnet == current_subnet
 
   # functions for identifying switches
   def is_router (self, ip_addr):

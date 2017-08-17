@@ -454,7 +454,7 @@ class DynamicTopology (EventMixin):
 
     elif move:
       assert new is not None
-      # NOTE: this would need to be changed if mupltiple interfaces
+      # NOTE: this would need to be changed if multiple interfaces
       #       per host was supported
       self.delete_host_flows(host.ipaddr.ip, host.macaddr)
       for n in self.graph.neighbors(str(host.macaddr))[:]:
@@ -494,13 +494,6 @@ class DynamicTopology (EventMixin):
   def _handle_openflow_PacketIn (self, event):
     """
     Populate MAC and IP tables based on incoming packets.
-
-    Handles only packets from ports identified as not switch-only.
-    If a MAC was not seen before, insert it in the MAC table;
-    otherwise, update table and enry.
-    If packet has a source IP, update that info for the host (may require
-    removing the info from antoher entry previously with that IP address).
-    It does not forward any packets, just extract info from them.
     """
 
     dpid = event.connection.dpid
@@ -536,7 +529,6 @@ class DynamicTopology (EventMixin):
 
     elif host != (dpid, inport, packet.src):
       self.update_host(host, move = True, new = New(dpid, inport))
-      change = True
 
     (pckt_srcip, hasARP) = self.getSrcIPandARP(packet.next)
     if pckt_srcip is not None and pckt_srcip != '0.0.0.0':

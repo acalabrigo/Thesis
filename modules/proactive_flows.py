@@ -22,11 +22,13 @@ import pox
 from networkx.algorithms.shortest_paths.generic import shortest_path
 
 import time
+from collections import namedtuple
 
 log = core.getLogger()
 all_ports = of.OFPP_FLOOD
 GATEWAY_DUMMY_MAC = '03:00:00:00:be:ef'
 
+Location = namedtuple('Location', 'dpid port')
 
 def dpid_to_mac (dpid):
   '''
@@ -45,6 +47,7 @@ class ProactiveFlows (object):
 
   def __init__ (self, idle_timeout=300):
     self.idle_timeout = idle_timeout
+    self.mac_to_loc = {} # MAC -> Location
     core.openflow.addListeners(self)
     core.listen_to_dependencies(self, ['dynamic_topology', 'dhcpd_multi'], short_attrs=True)
 
@@ -69,6 +72,8 @@ class ProactiveFlows (object):
       msg.actions.append(of.ofp_action_output(port = port))
 
     self.dynamic_topology.graph.node[node1]['connection'].send(msg)
+    if isinstance(node2, str):
+      self.mac_to_loc[node2] = Location(node1, port)
 
   def _edge_reply_local (self, dst, node1, node2):
     '''
@@ -88,6 +93,8 @@ class ProactiveFlows (object):
       msg.actions.append(of.ofp_action_output(port = port))
 
     self.dynamic_topology.graph.node[node1]['connection'].send(msg)
+    if isinstance(node2, str):
+      self.mac_to_loc[node2] = Location(node1, port)
     log.debug("Installing local L2 flow %s <-> %s" % (packet.src, packet.dst))
 
   def _core_reply(self, dst, node1, node2, mobile=False):
@@ -127,7 +134,7 @@ class ProactiveFlows (object):
 
     packet = event.parsed
     dpid = event.connection.dpid
-    t = time.time()
+
     if not packet.parsed:
       return
     if packet.type == ethernet.LLDP_TYPE: # Ignore LLDP packets
@@ -170,6 +177,14 @@ class ProactiveFlows (object):
                  str(true_dst)))
         return
 
+      # we already saw this
+      if self.has_path(path):
+        port = self.dynamic_topology.get_link_port(path[1], path[2])
+        msg = of.ofp_packet_out(data = event.ofp)
+        msg.actions.append(of.ofp_action_output(port = port))
+        event.connection.send(msg)
+        return
+
       for i in range(1, len(path) - 1):
         device = path[i]
         log.debug("adding flows to {0}".format(device))
@@ -183,21 +198,27 @@ class ProactiveFlows (object):
 
         else:   # central, so add flows for IP SUBNETS
           self._core_reply(ip_packet.dstip, device, path[i + 1],
-            mobile=(ip_packet.dstip in self.dhcpd_multi.mobile_hosts))
+            mobile = (not self.dhcpd_multi.on_home_subnet(path[len(path) - 2], ip_packet.dstip)))
           self._core_reply(ip_packet.srcip, device, path[i - 1],
-            mobile=(ip_packet.srcip in self.dhcpd_multi.mobile_hosts))
+            mobile = (not self.dhcpd_multi.on_home_subnet(path[1], ip_packet.srcip)))
 
+      # resend packet
       # forward the buffer out the first hop port
-      #msg = of.ofp_packet_out(buffer_id = event.ofp.buffer_id, in_port = event.ofp.in_port)
-      msg = of.ofp_packet_out()
+      port = self.dynamic_topology.get_link_port(path[1], path[2])
+      msg = of.ofp_packet_out(data = event.ofp)
+      msg.actions.append(of.ofp_action_output(port = port))
+      event.connection.send(msg)
+
+      '''msg = of.ofp_packet_out(buffer_id = event.ofp.buffer_id, in_port = event.ofp.in_port)
+      #msg = of.ofp_packet_out()
       if len(path) >= 3:
         port = self.dynamic_topology.get_link_port(path[1], path[2])
         action = of.ofp_action_output(port = port)
         msg.actions.append(action)
-        msg.data = event.ofp
-        msg.in_port = event.port
-        event.connection.send(msg)
-        
+        #msg.data = event.ofp
+        #msg.in_port = event.port
+        event.connection.send(msg)'''
+
     # CASE 2: the switch gets an ARP request from a host. In this case,
     # create an ARP reply based on the known network topology. Send this
     # back out the input port on the switch.
@@ -275,6 +296,14 @@ class ProactiveFlows (object):
           log.debug("No path found!")
           return
 
+        # we already saw this
+        if self.has_path(path):
+          port = self.dynamic_topology.get_link_port(path[1], path[2])
+          msg = of.ofp_packet_out(data = event.ofp)
+          msg.actions.append(of.ofp_action_output(port = port))
+          event.connection.send(msg)
+          return
+
         if not self.dhcpd_multi.is_local_path(path):
           log.warn('Ignoring non-local path {0} -> {1}'.format(str(src), str(dst)))
           return
@@ -283,8 +312,42 @@ class ProactiveFlows (object):
           device = path[i]
           self._edge_reply_local(dst, device, path[i + 1])
           self._edge_reply_local(src, device, path[i - 1])
+
+        port = self.dynamic_topology.get_link_port(path[1], path[2])
+        msg = of.ofp_packet_out(data = event.ofp)
+        msg.actions.append(of.ofp_action_output(port = port))
+        event.connection.send(msg)
+
       return
 
+  def has_path (self, path):
+    '''
+    Tell if this path has already had flow rules installed. Return True if this
+    exact path is already accounted for, False otherwise. An exact path has the
+    same 2 hosts connected on the same 2 ports on the same 2 switches.
+    '''
+
+    src = path[0]
+    dst = path[len(path) - 1]
+
+    if not src in self.mac_to_loc or not dst in self.mac_to_loc:
+      return False
+
+    new_src_dpid = path[1]
+    new_dst_dpid = path[len(path) - 2]
+    new_src_port = self.dynamic_topology.get_link_port(new_src_dpid, src)
+    new_dst_port = self.dynamic_topology.get_link_port(new_dst_dpid, dst)
+
+    old_src_dpid = self.mac_to_loc[src].dpid
+    old_dst_dpid = self.mac_to_loc[dst].dpid
+    old_src_port = self.mac_to_loc[src].port
+    old_dst_port = self.mac_to_loc[dst].port
+
+    if (new_src_dpid == old_src_dpid and new_src_port == old_src_port and
+      new_dst_dpid == old_dst_dpid and new_dst_port == old_dst_port):
+      return True
+
+    return False
 
 def launch (idle_timeout=300):
   if not core.hasComponent("proactive_flows"):
