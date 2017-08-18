@@ -309,7 +309,7 @@ class Subnet (object):
   really just a dummy address.
   '''
 
-  def __init__ (self, network, pool, switches, vlans, server,
+  def __init__ (self, network, pool, switches, server,
                 dns = None, subnet = None):
 
     def fix_addr (addr, backup):
@@ -335,7 +335,6 @@ class Subnet (object):
 
     self.address_pool = pool
     self.switches = switches
-    self.vlans = vlans # {switch : vlan}
 
     assert isinstance(server, tuple)
     self.server = server # (dpid, ipaddr)
