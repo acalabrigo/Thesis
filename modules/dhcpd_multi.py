@@ -29,6 +29,7 @@ from pox.lib.addresses import IP_BROADCAST, IP_ANY
 from pox.lib.revent import *
 from pox.lib.util import dpid_to_str
 from pox.lib.recoco import Timer
+import proactive_flows
 
 # networkX
 from networkx.algorithms.clique import find_cliques
@@ -309,8 +310,7 @@ class Subnet (object):
   really just a dummy address.
   '''
 
-  def __init__ (self, network, pool, switches, server,
-                dns = None, subnet = None):
+  def __init__ (self, network, pool, server, dns = None, subnet = None):
 
     def fix_addr (addr, backup):
       if addr is None: return None
@@ -334,7 +334,6 @@ class Subnet (object):
                            "pool with a subnet hint")
 
     self.address_pool = pool
-    self.switches = switches
 
     assert isinstance(server, tuple)
     self.server = server # (dpid, ipaddr)
@@ -351,15 +350,16 @@ class DHCPDMulti (EventMixin):
 
   _eventMixin_events = set([DHCPLease])
 
-  # constructor
   def __init__ (self, network = "192.168.0.0/24", dns = None):
 
       # attributes of our network
       self.network, self.network_size = parse_cidr(network)
       self.dns_addr = dns
       self.subnets = {}  # IP -> subnet
-      self.core = {} # dpid -> IP
-      self.mobile_hosts = [] # IPs
+      self.core = []
+      self.edges = {}
+      self.edge_to_core = {}
+      self.mobile_hosts = {} # MAC -> IP
 
       # attributes to track DHCP
       self.lease_time = timeoutSec['leaseInterval']
@@ -412,41 +412,37 @@ class DHCPDMulti (EventMixin):
     if event.stable and self._first_stable:
       cliques = find_cliques(graph)
       core = max(cliques, key=lambda x: len(x))
-      core_ips = []
+      edge_ips = []
 
       if core is None:
         log.warn('No core mesh found in this network...')
         return
 
-      core_switches = {s:[] for s in core}
-      not_core = [node for node in graph if node not in core and
-                  not isinstance(node, str)]
+      edges = [node for node in graph if node not in core and
+               not isinstance(node, str)]
+      for edge in edges:
+        self.edge_to_core[edge] = graph.neighbors(edge)[0]
 
-      for switch in not_core:
-        closest_core = min(core, key=lambda x: len(shortest_path(
-                           graph, source=switch, target=x)))
-        core_switches[closest_core].append(switch)
-
-      for i,c in enumerate(core):
+      for i,c in enumerate(edges):
         network_addr = IPAddr(self.network).toUnsigned() | (i << (32 - self.network_size))
         server_addr = IPAddr(network_addr + 1)
-        core_ips.append(server_addr)
+        edge_ips.append(server_addr)
         network_addr = IPAddr(network_addr)
         pool = SimpleAddressPool(str(network_addr) + '/' + str(self.network_size))
         subnet = Subnet(network = server_addr, pool = pool,
-                        switches = core_switches[c], server = Server(c, server_addr),
+                        server = Server(c, server_addr),
                         dns = self.dns_addr, subnet = self.network_size)
-        self.subnets[server_addr] = subnet
+        self.subnets[str(network_addr) + '/' + str(self.network_size)] = subnet
         self.leases[subnet] = {}
         self.offers[subnet] = {}
-        log.info('{0} serves subnet {1} on switches {2}'.format(server_addr,
-                                                                network_addr,
-                                                                core_switches[c]))
+        log.info('{0} serves subnet {1}'.format(server_addr, network_addr))
 
-      self.core = dict(zip(core, core_ips))
+      self.core = core
+      self.edges = dict(zip(edges, edge_ips))
       self._first_stable = False
       self._t = Timer(timeoutSec['timerInterval'], self._check_leases,
                       recurring=True)
+      proactive_flows.launch()
 
   def _dhcp_PacketIn (self, event):
     '''
@@ -459,7 +455,7 @@ class DHCPDMulti (EventMixin):
     # Is it to us?  (Or at least not specifically NOT to us...)
     ipp = event.parsed.find('ipv4')
     if (ipp.dstip not in (IP_ANY, IP_BROADCAST) and
-       ipp.dstip not in self.core.values()):
+       ipp.dstip not in self.edges.values()):
       return
 
     nwp = ipp.payload
@@ -485,12 +481,12 @@ class DHCPDMulti (EventMixin):
           log.info('{0} moved from {1} to {2}, is now mobile with {3}'.format(
                    src, home_subnet.server.addr, subnet.server.addr, ip_addr))
           subnet = home_subnet
-          if ip_addr not in self.mobile_hosts:
-            self.mobile_hosts.append(ip_addr)
-        elif home_subnet == subnet and ip_addr in self.mobile_hosts:
+          if src not in self.mobile_hosts:
+            self.mobile_hosts[src] = ip_addr
+        elif home_subnet == subnet and src in self.mobile_hosts:
           log.info('{0} moved from {1} to {2}, is now back on home subnet with {3}'.format(
                    src, home_subnet.server.addr, subnet.server.addr, ip_addr))
-          self.mobile_hosts.remove(ip_addr)
+          del self.mobile_hosts[src]
 
     if t.type == p.DISCOVER_MSG:
       self.exec_discover(event, p, subnet)
@@ -724,7 +720,7 @@ class DHCPDMulti (EventMixin):
     """
 
     subnet = [self.subnets[s] for s in self.subnets
-              if dpid in self.subnets[s].switches]
+              if dpid == self.subnets[s].server.dpid]
     assert len(subnet) == 1
     return subnet[0]
 
@@ -733,7 +729,8 @@ class DHCPDMulti (EventMixin):
     Given a switch, return the network address/subnet_mask it's on.
     '''
 
-    subnet = [self.subnets[s] for s in self.subnets if dpid in self.subnets[s].switches]
+    subnet = [self.subnets[s] for s in self.subnets
+              if dpid == self.subnets[s].server.dpid]
     if len(subnet) is 1:
       subnet = subnet[0]
       network, subnet_mask = subnet.pool.network, subnet.pool.subnet_mask
@@ -767,21 +764,6 @@ class DHCPDMulti (EventMixin):
     ip_addr = IPAddr(ip_addr)
     match = [ip for ip in self.subnets.itervalues() if ip_addr == ip.server.addr]
     return len(match) == 1
-
-  def is_core (self, dpid):
-    '''
-    Does this DPID identify a core switch in our network?
-    '''
-
-    return (dpid in self.core)
-
-  def is_local_path (self, path):
-    '''
-    Is this traffic localized to one subnet?
-    '''
-
-    core_switches = [node for node in path[1:-1] if node in self.core]
-    return central_switches == []
 
 
 # load DHCPDMulti

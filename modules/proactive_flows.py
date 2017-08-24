@@ -3,7 +3,7 @@
 
 # POX
 from pox.core import core
-from pox.lib.addresses import EthAddr, IPAddr
+from pox.lib.addresses import EthAddr, IPAddr, parse_cidr
 from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.ipv4 import ipv4
 from pox.lib.packet.udp import udp
@@ -27,8 +27,9 @@ from collections import namedtuple
 log = core.getLogger()
 all_ports = of.OFPP_FLOOD
 GATEWAY_DUMMY_MAC = '03:00:00:00:be:ef'
+LABEL_START = 16
 
-Location = namedtuple('Location', 'dpid port')
+LabelInfo = namedtuple('LabelInfo', 'dpid1 dpid2 dst_subnet')
 
 def dpid_to_mac (dpid):
   '''
@@ -47,82 +48,43 @@ class ProactiveFlows (object):
 
   def __init__ (self, idle_timeout=300):
     self.idle_timeout = idle_timeout
-    self.mac_to_loc = {} # MAC -> Location
+    self.label_table = {} # (dpid1, dpid2, dst_subnet) -> label number
+    self.label_count = LABEL_START
     core.openflow.addListeners(self)
     core.listen_to_dependencies(self, ['dynamic_topology', 'dhcpd_multi'], short_attrs=True)
 
   def _all_dependencies_met (self):
+    '''
+    When all modules are loaded, install base flow rules based on network.
+    '''
+
+    graph = self.dynamic_topology.graph
+    edge_switches = list(self.dhcpd_multi.edges)
+
+    # install subnet-based rules between core switches
+    for s1 in edge_switches:
+      for s2 in [e for e in edge_switches if e != s1]:
+        sp = shortest_path(graph, source = s1, target = s2)
+        subnet = self.dhcpd_multi.get_switch_subnet(sp[len(sp) - 1])
+        for k in range(0, len(sp) - 1):
+          info = LabelInfo(sp[k], sp[k + 1], subnet)
+          outlabel = self.get_label(info)
+          if k > 0:
+            self.install_path_rule(info, inlabel, outlabel)
+          inlabel = outlabel
+
     log.info("proactive_flows ready")
 
-  def _edge_reply (self, dst, node1, node2):
+  def get_label (self, info):
     '''
-    Create a flow mod packet for an edge switch.
-    '''
-
-    msg = of.ofp_flow_mod()
-    msg.match.dl_type = ethernet.IP_TYPE
-    msg.match.nw_dst = dst
-    port = self.dynamic_topology.get_link_port(node1, node2)
-
-    if port is None:
-      log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
-      return
-    else:
-      msg.idle_timeout = self.idle_timeout
-      msg.actions.append(of.ofp_action_output(port = port))
-
-    self.dynamic_topology.graph.node[node1]['connection'].send(msg)
-    if isinstance(node2, str):
-      self.mac_to_loc[node2] = Location(node1, port)
-
-  def _edge_reply_local (self, dst, node1, node2):
-    '''
-    Create a flow mod packet for an edge switch for l2 traffic within the
-    subnet.
+    Given information about a link and destination subnet,
+    return the proper label or allocate a new label.
     '''
 
-    msg = of.ofp_flow_mod()
-    msg.match.dl_dst = dst
-    port = self.dynamic_topology.get_link_port(node1, node2)
-
-    if port is None:
-      log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
-      return
-    else:
-      msg.idle_timeout = self.idle_timeout
-      msg.actions.append(of.ofp_action_output(port = port))
-
-    self.dynamic_topology.graph.node[node1]['connection'].send(msg)
-    if isinstance(node2, str):
-      self.mac_to_loc[node2] = Location(node1, port)
-    log.debug("Installing local L2 flow %s <-> %s" % (packet.src, packet.dst))
-
-  def _core_reply(self, dst, node1, node2, mobile=False):
-    '''
-    Create a flow mod packet for a central switch.
-    '''
-    # flow mod for outgoing packets
-    msg = of.ofp_flow_mod()
-    msg.match.dl_type = ethernet.IP_TYPE
-    subnet = self.dhcpd_multi.get_subnet(dst)
-
-    if not mobile:
-      msg.match.nw_dst = subnet
-      if msg.match.nw_dst is None:
-        log.warn("Could not find subnet for IP {0}'".format(dst))
-        return
-    else:
-      msg.match.nw_dst = dst
-      msg.priority = 0x8000 + 50
-
-    port = self.dynamic_topology.get_link_port(node1, node2)
-    if port is None:
-      log.warn("Could not find {0} in {1}'s port table'".format(node2, node1))
-      return
-    else:
-      msg.idle_timeout = self.idle_timeout
-      msg.actions.append(of.ofp_action_output(port = port))
-      self.dynamic_topology.graph.node[node1]['connection'].send(msg)
+    if info not in self.label_table:
+      self.label_table[info] = self.label_count
+      self.label_count += 1
+    return self.label_table[info]
 
   def _handle_PacketIn (self, event):
     '''
@@ -140,10 +102,7 @@ class ProactiveFlows (object):
     if packet.type == ethernet.LLDP_TYPE: # Ignore LLDP packets
       return
 
-    # CASE 1: ipv4 traffic into the switch. In this case, create a flow table
-    # entry in each switch along the shortest path. If a switch is an edge
-    # switch, install flows based on MAC. If ta switch is centralized,
-    # install flows based on IP.
+    # CASE 1: ipv4 traffic into the switch
     if isinstance(packet.next, ipv4):
       ip_packet = packet.next
 
@@ -158,66 +117,30 @@ class ProactiveFlows (object):
       # this is the host sending a packet to its "default gateway" which doesn't
       # really exist
       true_dst = packet.dst
+      dst_host = self.dynamic_topology.get_host_info(ip_packet.dstip)
       if packet.dst == EthAddr(GATEWAY_DUMMY_MAC):
-        host = self.dynamic_topology.get_host_info(ip_packet.dstip)
-        true_dst = host.macaddr
+        true_dst = dst_host.macaddr
         if true_dst is None:
           log.warning('Host with IP {0} is not on this network'.format(ip_packet.dstip))
           return
 
-      # retrieve graph info, find shortest path between devices
-      #log.info("{0} Looking for path from {1} to {2}".format(dpid, packet.src, true_dst))
-      graph = self.dynamic_topology.graph
-      path = shortest_path(graph, str(packet.src), str(true_dst))
+      dst_subnet = self.dhcpd_multi.get_switch_subnet(dst_host.dpid)
+      next_hop = self.dhcpd_multi.edge_to_core[dpid]
 
-      if path is not None:
-        log.debug("path found: {0}".format(path))
-      else:
-        log.warn("No path found for {0} => {1}!".format(str(packet.src),
-                 str(true_dst)))
-        return
-
-      # we already saw this
-      if self.has_path(path):
-        port = self.dynamic_topology.get_link_port(path[1], path[2])
-        msg = of.ofp_packet_out(data = event.ofp)
-        msg.actions.append(of.ofp_action_output(port = port))
-        event.connection.send(msg)
-        return
-
-      for i in range(1, len(path) - 1):
-        device = path[i]
-        log.debug("adding flows to {0}".format(device))
-
-        # if edge node, add flows for MAC
-        #NOTE: checking if switch is at an edge is fine, as long as the assumption
-        #      holds that only edge switches have hosts
-        if self.dhcpd_multi.is_core(device) == False:
-          self._edge_reply(ip_packet.dstip, device, path[i + 1])
-          self._edge_reply(ip_packet.srcip, device, path[i - 1])
-
-        else:   # central, so add flows for IP SUBNETS
-          self._core_reply(ip_packet.dstip, device, path[i + 1],
-            mobile = (not self.dhcpd_multi.on_home_subnet(path[len(path) - 2], ip_packet.dstip)))
-          self._core_reply(ip_packet.srcip, device, path[i - 1],
-            mobile = (not self.dhcpd_multi.on_home_subnet(path[1], ip_packet.srcip)))
+      push_info = LabelInfo(dpid, next_hop, dst_subnet)
+      pop_info = LabelInfo(self.dhcpd_multi.edge_to_core[dst_host.dpid],
+                           dst_host.dpid, dst_subnet)
+      self.install_push_rule(push_info, self.get_label(push_info),
+                             ip_packet.dstip, true_dst)
+      self.install_pop_rule(dst_host.dpid, dst_host.macaddr, self.get_label(pop_info))
+      log.debug("added flows for {0} --> {1}".format(ip_packet.srcip, ip_packet.dstip))
 
       # resend packet
       # forward the buffer out the first hop port
-      port = self.dynamic_topology.get_link_port(path[1], path[2])
+      port = self.dynamic_topology.get_link_port(dpid, next_hop)
       msg = of.ofp_packet_out(data = event.ofp)
       msg.actions.append(of.ofp_action_output(port = port))
       event.connection.send(msg)
-
-      '''msg = of.ofp_packet_out(buffer_id = event.ofp.buffer_id, in_port = event.ofp.in_port)
-      #msg = of.ofp_packet_out()
-      if len(path) >= 3:
-        port = self.dynamic_topology.get_link_port(path[1], path[2])
-        action = of.ofp_action_output(port = port)
-        msg.actions.append(action)
-        #msg.data = event.ofp
-        #msg.in_port = event.port
-        event.connection.send(msg)'''
 
     # CASE 2: the switch gets an ARP request from a host. In this case,
     # create an ARP reply based on the known network topology. Send this
@@ -276,78 +199,94 @@ class ProactiveFlows (object):
                   str(arp_reply.protosrc)))
               return
 
-    # CASE 3: here we look to see if we have an L2 protocol localized on a
-    # single subnet. In this case, we install L2 flows on this subnet
-    else:
-      dst = packet.dst
-      src = packet.src
-      if dst == EthAddr(GATEWAY_DUMMY_MAC):
-        log.warn('Packet of type {0} not supported yet'.format(type(packet.next)))
-        return
-
-      if dst in self.dynamic_topology.graph:
-        log.debug("{0} Looking for path from {1} to {2}".format(dpid, src, dst))
-        graph = self.dynamic_topology.graph
-        path = shortest_path(graph, str(src), str(dst))
-
-        if path is not None:
-          log.debug("Path found: {0}".format(path))
-        else:
-          log.debug("No path found!")
-          return
-
-        # we already saw this
-        if self.has_path(path):
-          port = self.dynamic_topology.get_link_port(path[1], path[2])
-          msg = of.ofp_packet_out(data = event.ofp)
-          msg.actions.append(of.ofp_action_output(port = port))
-          event.connection.send(msg)
-          return
-
-        if not self.dhcpd_multi.is_local_path(path):
-          log.warn('Ignoring non-local path {0} -> {1}'.format(str(src), str(dst)))
-          return
-
-        for i in range(1, len(path) - 1):
-          device = path[i]
-          self._edge_reply_local(dst, device, path[i + 1])
-          self._edge_reply_local(src, device, path[i - 1])
-
-        port = self.dynamic_topology.get_link_port(path[1], path[2])
-        msg = of.ofp_packet_out(data = event.ofp)
-        msg.actions.append(of.ofp_action_output(port = port))
-        event.connection.send(msg)
-
       return
 
-  def has_path (self, path):
+  def install_push_rule (self, info, label, ip, raddr):
     '''
-    Tell if this path has already had flow rules installed. Return True if this
-    exact path is already accounted for, False otherwise. An exact path has the
-    same 2 hosts connected on the same 2 ports on the same 2 switches.
+    Install a flow rule on an edge switch to push a label
+    onto a flow.
     '''
 
-    src = path[0]
-    dst = path[len(path) - 1]
+    # message for switch
+    msg = of.ofp_flow_mod()
 
-    if not src in self.mac_to_loc or not dst in self.mac_to_loc:
-      return False
+    # match on MAC dst and IP dst
+    msg.match.dl_src = None # wildcard source MAC
+    msg.match.dl_dst = EthAddr(GATEWAY_DUMMY_MAC)
+    msg.match.dl_type = ethernet.IP_TYPE
+    msg.match.nw_src = None # wildcard source IP
+    msg.match.nw_dst = ip
 
-    new_src_dpid = path[1]
-    new_dst_dpid = path[len(path) - 2]
-    new_src_port = self.dynamic_topology.get_link_port(new_src_dpid, src)
-    new_dst_port = self.dynamic_topology.get_link_port(new_dst_dpid, dst)
+    # actions - rewrite MAC dst and push label
+    msg.actions.append(of.ofp_action_dl_addr.set_dst(raddr))
+    msg.actions.append(of.ofp_action_vlan_vid(vlan_vid=label))
 
-    old_src_dpid = self.mac_to_loc[src].dpid
-    old_dst_dpid = self.mac_to_loc[dst].dpid
-    old_src_port = self.mac_to_loc[src].port
-    old_dst_port = self.mac_to_loc[dst].port
+    # set output port action
+    port = self.dynamic_topology.get_link_port(info.dpid1, info.dpid2)
+    if port is None:
+      log.warn("No port connecting {0} --> {1}".format(info.dpid1, info.dpid2))
+      return
+    msg.actions.append(of.ofp_action_output(port = port))
 
-    if (new_src_dpid == old_src_dpid and new_src_port == old_src_port and
-      new_dst_dpid == old_dst_dpid and new_dst_port == old_dst_port):
-      return True
+    # set a timeout and send
+    msg.idle_timeout = self.idle_timeout
+    self.dynamic_topology.graph.node[info.dpid1]['connection'].send(msg)
 
-    return False
+  def install_pop_rule (self, dpid, mac, label):
+    '''
+    Install a flow rule on an edge switch to pop a label
+    onto a flow.
+    '''
+
+    # message for switch
+    msg = of.ofp_flow_mod()
+
+    # match on MAC dst and IP dst
+    msg.match.dl_src = None # wildcard source MAC
+    msg.match.dl_dst = None
+    msg.match.dl_type = ethernet.IP_TYPE
+    msg.match.dl_vlan = label
+
+    # actions - pop label
+    msg.actions.append(of.ofp_action_strip_vlan())
+
+    # set output port action
+    port = self.dynamic_topology.get_link_port(dpid, str(mac))
+    if port is None:
+      log.warn("No port connecting {0} --> {1}".format(dpid, mac))
+      return
+    msg.actions.append(of.ofp_action_output(port = port))
+
+    # set a timeout and send
+    msg.idle_timeout = self.idle_timeout
+    self.dynamic_topology.graph.node[dpid]['connection'].send(msg)
+
+  def install_path_rule (self, info, inlabel, outlabel):
+    '''
+    Install a flow rule on a core switch to route based on label.
+    '''
+
+    # message for switch
+    msg = of.ofp_flow_mod()
+
+    # match on MAC dst and IP dst
+    msg.match.dl_src = None # wildcard MACs
+    msg.match.dl_dst = None
+    msg.match.dl_vlan = inlabel
+
+    # actions - rewrite MAC dst and push label
+    msg.actions.append(of.ofp_action_vlan_vid(vlan_vid=outlabel))
+
+    # set output port action
+    port = self.dynamic_topology.get_link_port(info.dpid1, info.dpid2)
+    if port is None:
+      log.warn("No port connecting {0} --> {1}".format(info.dpid1, info.dpid2))
+      return
+    msg.actions.append(of.ofp_action_output(port = port))
+
+    # set a timeout and send
+    #msg.idle_timeout = None # these flows are static
+    self.dynamic_topology.graph.node[info.dpid1]['connection'].send(msg)
 
 def launch (idle_timeout=300):
   if not core.hasComponent("proactive_flows"):

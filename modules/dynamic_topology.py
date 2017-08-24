@@ -257,18 +257,6 @@ class DynamicTopology (EventMixin):
           self.last_stable, self.last_check = self.stable, time.time()
           self.raiseEventNoErrors(StableEvent, stable = self.stable, graph = self.graph)
 
-    # extra debug settings -- not recommended as makes output difficult to read
-    '''if self.debug and self.stable:
-      log.debug("----- DEBUG -----")
-      for s in self.switches.iteritems():
-        log.debug("switch {0} : ports {1}".format(s[0], s[1].ports))
-      for h in self.hosts.iteritems():
-        if h[1].entry.ipaddr is not None:
-          log.debug("host {0} : has ip {1}".format(h[0], h[1].entry.ipaddr.ip))
-        else:
-          log.debug("host {0} : no ip yet".format(h[0]))
-      log.debug("graph: {0}".format(self.graph))'''
-
   def _check_host_timeouts (self):
     """
     Checks for timed out hosts
@@ -507,10 +495,11 @@ class DynamicTopology (EventMixin):
     if packet.type == ethernet.LLDP_TYPE: # Ignore LLDP packets
       return
 
+    # NOTE: this is critical
     if not self.is_edge_port(dpid, inport):
       # No host should be right behind a switch-only port
       log.debug("%i %i ignoring packetIn at switch-only port", dpid, inport)
-      return
+      return EventHalt
 
     log.debug("PacketIn: %i %i ETH %s => %s",
               dpid, inport, str(packet.src), str(packet.dst))
