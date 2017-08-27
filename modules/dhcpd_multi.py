@@ -22,18 +22,16 @@
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
 import pox.lib.packet as pkt
-from pox.lib.packet.arp import arp
 from pox.lib.packet.ethernet import ethernet
 from pox.lib.addresses import IPAddr,EthAddr,parse_cidr,cidr_to_netmask
 from pox.lib.addresses import IP_BROADCAST, IP_ANY
-from pox.lib.revent import *
+from pox.lib.revent import Event, EventHalt, EventMixin
 from pox.lib.util import dpid_to_str
 from pox.lib.recoco import Timer
 import proactive_flows
 
 # networkX
 from networkx.algorithms.clique import find_cliques
-from networkx.algorithms.shortest_paths.generic import shortest_path
 
 # general
 import time
@@ -358,7 +356,7 @@ class DHCPDMulti (EventMixin):
       self.subnets = {}  # IP -> subnet
       self.core = []
       self.edges = {}
-      self.edge_to_core = {}
+      self.edge_to_tuple = {} # dpid -> (network, core dpid)
       self.mobile_hosts = {} # MAC -> IP
 
       # attributes to track DHCP
@@ -400,6 +398,7 @@ class DHCPDMulti (EventMixin):
       event.component.addListenerByName("StableEvent",
           self._dynamic_topology_stable)
       event.component.addListenerByName("DHCPEvent", self._dhcp_PacketIn)
+      event.component.addListenerByName("FlowDeleteEvent", self._delete_flows)
       log.info('connected to dynamic_topology')
 
   # interacting with dynamic_topology
@@ -420,19 +419,19 @@ class DHCPDMulti (EventMixin):
 
       edges = [node for node in graph if node not in core and
                not isinstance(node, str)]
-      for edge in edges:
-        self.edge_to_core[edge] = graph.neighbors(edge)[0]
 
       for i,c in enumerate(edges):
         network_addr = IPAddr(self.network).toUnsigned() | (i << (32 - self.network_size))
         server_addr = IPAddr(network_addr + 1)
         edge_ips.append(server_addr)
         network_addr = IPAddr(network_addr)
-        pool = SimpleAddressPool(str(network_addr) + '/' + str(self.network_size))
+        cidr = "%s/%s" % (str(network_addr), str(self.network_size))
+        pool = SimpleAddressPool(cidr)
         subnet = Subnet(network = server_addr, pool = pool,
                         server = Server(c, server_addr),
                         dns = self.dns_addr, subnet = self.network_size)
-        self.subnets[str(network_addr) + '/' + str(self.network_size)] = subnet
+        self.subnets[cidr] = subnet
+        self.edge_to_tuple[c] = (cidr, graph.neighbors(c)[0])
         self.leases[subnet] = {}
         self.offers[subnet] = {}
         log.info('{0} serves subnet {1}'.format(server_addr, network_addr))
@@ -478,14 +477,14 @@ class DHCPDMulti (EventMixin):
         assert len(home_subnet) is 1
         home_subnet = home_subnet[0]
         if home_subnet != subnet:
-          log.info('{0} moved from {1} to {2}, is now mobile with {3}'.format(
+          log.debug('{0} moved from {1} to {2}, is now mobile with {3}'.format(
                    src, home_subnet.server.addr, subnet.server.addr, ip_addr))
           subnet = home_subnet
           if src not in self.mobile_hosts:
             self.mobile_hosts[src] = ip_addr
         elif home_subnet == subnet and src in self.mobile_hosts:
-          log.info('{0} moved from {1} to {2}, is now back on home subnet with {3}'.format(
-                   src, home_subnet.server.addr, subnet.server.addr, ip_addr))
+          log.debug('{0} moved from {1} to {2}, is now back on home subnet with {3}'.format(
+                    src, home_subnet.server.addr, subnet.server.addr, ip_addr))
           del self.mobile_hosts[src]
 
     if t.type == p.DISCOVER_MSG:
@@ -496,6 +495,23 @@ class DHCPDMulti (EventMixin):
       self.exec_release(event, p, subnet)
 
     return EventHalt
+
+  def _delete_flows (self, event):
+    '''
+    Delete outdated flows from switches.
+    '''
+
+    ip = event.ip
+    graph = event.graph
+
+    assert ip is not None and graph is not None
+    log.debug("Removing flows for {0}".format(ip))
+    for switch in self.edges:
+      msg = of.ofp_flow_mod()
+      msg.match.dl_type = ethernet.IP_TYPE
+      msg.match.nw_dst = ip
+      msg.command = of.OFPFC_DELETE
+      graph.node[switch]['connection'].send(msg)
 
   # verification that component is ready
   def _all_dependencies_met (self):
@@ -519,7 +535,7 @@ class DHCPDMulti (EventMixin):
           self.raiseEvent(ev)
           del leases[client]
           if ev._nak:
-            self.nak(event)
+            self.nak(ev)
 
   # helpers for sending DHCP packets
   def reply (self, event, subnet, msg):
@@ -660,7 +676,7 @@ class DHCPDMulti (EventMixin):
     assert got_ip == wanted_ip
     self.leases[subnet][src] = got_ip
     ev = DHCPLease(src, got_ip.ip, port, dpid, renew=True)
-    log.info("%s leased %s to %s" % (subnet.server.addr, got_ip, src))
+    log.debug("%s leased %s to %s" % (subnet.server.addr, got_ip, src))
     self.raiseEvent(ev)
     if ev._nak:
       self.nak(event, subnet)
@@ -694,24 +710,11 @@ class DHCPDMulti (EventMixin):
     log.info("%s released %s from %s" % (subnet.server.addr, p.ciaddr, src))
     self.raiseEvent(ev)
     del self.leases[subnet][p.chaddr]
-    pool.append(p.ciaddr)
+    subnet.pool.append(p.ciaddr)
 
     log.debug("%s released %s" % (src,p.ciaddr))
 
   # functions for determining subnet
-  def get_subnet (self, ip_addr):
-    '''
-    Given an IP, return the network address/subnet_mask.
-    '''
-
-    subnet = [self.subnets[s] for s in self.subnets if ip_addr in self.subnets[s].pool.removed]
-    if len(subnet) != 1:
-      raise RuntimeError("{0} is on {1} subnets".format(ip_addr, len(subnet)))
-      return None
-    subnet = subnet[0]
-    network, subnet_mask = subnet.pool.network, subnet.pool.subnet_mask
-    return str(network) + '/' + str(subnet_mask)
-
   def get_event_subnet (self, dpid):
     """
     Get a subnet for this switch.
@@ -723,37 +726,6 @@ class DHCPDMulti (EventMixin):
               if dpid == self.subnets[s].server.dpid]
     assert len(subnet) == 1
     return subnet[0]
-
-  def get_switch_subnet (self, dpid):
-    '''
-    Given a switch, return the network address/subnet_mask it's on.
-    '''
-
-    subnet = [self.subnets[s] for s in self.subnets
-              if dpid == self.subnets[s].server.dpid]
-    if len(subnet) is 1:
-      subnet = subnet[0]
-      network, subnet_mask = subnet.pool.network, subnet.pool.subnet_mask
-      return str(network) + '/' + str(subnet_mask)
-    else:
-      if len(subnet) > 1:
-        log.warn("{0} is on multiple subnets: {1}".format(dpid, subnet))
-      else:
-        log.warn("{0} is not on a subnet".format(dpid))
-      return None
-
-  def on_home_subnet (self, dpid, ip_addr):
-    '''
-    Given a host IP and the dpid of a switch, determine if that switch is
-    on the hosts home subnet.
-    '''
-
-    current_subnet = self.get_event_subnet(dpid)
-    home_subnet = [self.subnets[s] for s in self.subnets if ip_addr
-                   in self.subnets[s].pool.removed]
-    assert len(home_subnet) is 1
-    home_subnet = home_subnet[0]
-    return home_subnet == current_subnet
 
   # functions for identifying switches
   def is_router (self, ip_addr):

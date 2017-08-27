@@ -6,30 +6,20 @@
 # POX
 from pox.core import core
 from pox.lib.recoco import Timer
-from pox.lib.revent import Event, EventHalt
+from pox.lib.revent import Event, EventHalt, EventMixin
 import pox.openflow.libopenflow_01 as of
 import pox.lib.packet as pkt
 from pox.lib.packet.arp import arp
 from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.ipv4 import ipv4
-from pox.lib.packet.dhcp import dhcp
-from pox.lib.addresses import IPAddr,EthAddr,parse_cidr
-from pox.lib.addresses import IP_BROADCAST, IP_ANY
-import pox.openflow.discovery as discovery
-import pox.openflow.topology as of_topo
-from pox.lib.revent.revent import *
-from pox.lib.util import dpid_to_str, str_to_bool
-from pox.lib.packet.ethernet import ethernet
-import pox
-
-import time
+from pox.lib.addresses import EthAddr
+from pox.lib.util import str_to_bool
 
 # networkX
 import networkx as nx
-from networkx.algorithms.clique import find_cliques
-from networkx.algorithms.shortest_paths.generic import shortest_path
 
 from collections import namedtuple
+import time
 
 log = core.getLogger()
 
@@ -173,6 +163,17 @@ class DHCPEvent (Event):
     self.graph = graph
 
 
+class FlowDeleteEvent (Event):
+  '''
+  Event when the topology needs to delete a flow.
+  '''
+
+  def __init__ (self,  ip, graph):
+    super(FlowDeleteEvent, self).__init__();
+    self.ip = ip
+    self.graph = graph
+
+
 class DynamicTopology (EventMixin):
   '''
   POX module that creates a dynamic adjacency list representation of the
@@ -180,13 +181,14 @@ class DynamicTopology (EventMixin):
   and the host_tracker module to track host locations and MAC/IPs.
   '''
 
-  _eventMixin_events = set([StableEvent, DHCPEvent])
+  _eventMixin_events = set([StableEvent, DHCPEvent, FlowDeleteEvent])
 
   # constructor
   def __init__ (self, debug = False, check_interval = 5.0, ping_src_mac = None,
                 eat_packets = True):
     # the graph of the network
     self.graph = nx.Graph()
+    self.hosts = []
 
     # send pings from dummy address to check liveliness
     if ping_src_mac is None:
@@ -262,11 +264,8 @@ class DynamicTopology (EventMixin):
     Checks for timed out hosts
     """
 
-    for host in [node for node in self.graph.nodes(data=True)
-                 if 'info' in node[1]]:
-      # host[0] is the MAC and host[1] is the dict of attributes
+    for host in self.hosts[:]:
       entry_pinged = False
-      host = host[1]['info']
       if host.ipaddr is not None:
         ip_addr, ip_address = host.ipaddr.ip, host.ipaddr
         if ip_address.expired():
@@ -396,34 +395,6 @@ class DynamicTopology (EventMixin):
       return None
 
   # Host management
-  def delete_host_flows (self, ip, mac):
-
-    assert ip is not None and mac is not None
-    # remove this host from our flow tables
-    switches = [node for node in self.graph.nodes(data=True)
-                if not isinstance(node[0], str)]
-    for s in switches:
-      assert 'connection' in s[1]
-
-      msg = of.ofp_flow_mod()
-      msg.match.dl_type = ethernet.IP_TYPE
-      msg.match.nw_dst = ip
-      msg.command = of.OFPFC_DELETE
-      s[1]['connection'].send(msg)
-
-      msg = of.ofp_flow_mod()
-      msg.match.dl_dst = mac
-      msg.command = of.OFPFC_DELETE
-      s[1]['connection'].send(msg)
-
-  def host_is_mobile (self, host_mac, is_mobile):
-    '''
-    Mark a host as mobile.
-    '''
-
-    assert host_mac in self.graph
-    self.graph.node[str(host_mac)]['info'].is_mobile = is_mobile
-
   def update_host (self, host, join=False, leave=False, move=False, new=None):
     '''
     When mobile_host_tracker generates HostEvents, then a host has
@@ -432,36 +403,43 @@ class DynamicTopology (EventMixin):
     '''
 
     assert sum(1 for x in [join,leave,move] if x) == 1
-
+    m = str(host.macaddr)
     if leave:
       if str(host.macaddr) in self.graph:
         if host.ipaddr is not None:
-          self.delete_host_flows(host.ipaddr.ip, host.macaddr)
-        log.info('{0} left'.format(str(host)))
-        self.graph.remove_node(str(host.macaddr))
+          self.raiseEventNoErrors(FlowDeleteEvent, ip = host.ipaddr.ip, graph = self.graph)
+          #self.delete_host_flows(host.ipaddr.ip, host.dpid)
+        log.debug('{0} left'.format(str(host)))
+        self.hosts.remove(host)
+        del self.graph[host.macaddr]
+        self.graph.remove_node(m)
 
     elif move:
       assert new is not None
       # NOTE: this would need to be changed if multiple interfaces
       #       per host was supported
-      self.delete_host_flows(host.ipaddr.ip, host.macaddr)
-      for n in self.graph.neighbors(str(host.macaddr))[:]:
-        self.graph.remove_edge(str(host.macaddr), n)
+      self.raiseEventNoErrors(FlowDeleteEvent, ip = host.ipaddr.ip, graph = self.graph)
+      #self.delete_host_flows(host.ipaddr.ip, host.dpid)
+      #for n in self.graph.neighbors(str(host.macaddr))[:]:
+        #self.graph.remove_edge(str(host.macaddr), n)
+
+      map(lambda x: self.graph.remove_edge(m, x), self.graph.neighbors(m)[:])
 
       # host ports not factored in
-      self.graph.add_edge(new.dpid, str(host.macaddr), port=new.port)
-      log.info('{0} moved from {1} port {2} --> {3} port {4}'.format(
+      self.graph.add_edge(new.dpid, m, port=new.port)
+      log.debug('{0} moved from {1} port {2} --> {3} port {4}'.format(
         host.macaddr, host.dpid, host.port, new.dpid, new.port))
       host.dpid = new.dpid
       host.port = new.port
       host.refresh()
 
     else: # join
-      self.graph.add_node(str(host.macaddr))
-      self.graph.add_edge(host.dpid, str(host.macaddr), port=host.port)
-      self.graph.node[str(host.macaddr)]['info'] = host
+      self.graph.add_node(m)
+      self.graph.add_edge(host.dpid, m, port=host.port)
+      self.graph.node[m]['info'] = host
       host.refresh()
-      log.info('{0} joined on {1} port {2}'.format(host.macaddr, host.dpid, host.port))
+      self.hosts.append(host)
+      log.debug('{0} joined on {1} port {2}'.format(host.macaddr, host.dpid, host.port))
 
   def get_host_info (self, ip):
     '''
@@ -469,15 +447,9 @@ class DynamicTopology (EventMixin):
     what ARP does.
     '''
 
-    hosts = [node for node in self.graph.nodes(data=True)
-            if 'info' in node[1] and node[1]['info'].ipaddr is not None and
-            node[1]['info'].ipaddr.ip == ip]
-
-    if len(hosts) is 1:
-      return hosts[0][1]['info']
-    elif len(hosts) > 1:
-      log.warn("found multiple hosts with IP {0}".format(ip))
-    return None
+    hosts = [host for host in self.hosts if host.ipaddr is not None and
+            host.ipaddr.ip == ip]
+    return hosts[0]
 
   def _handle_openflow_PacketIn (self, event):
     """
@@ -514,7 +486,6 @@ class DynamicTopology (EventMixin):
     if not host:
       host = Host(dpid,inport,packet.src)
       self.update_host(host, join = True)
-      change = True
 
     elif host != (dpid, inport, packet.src):
       self.update_host(host, move = True, new = New(dpid, inport))
