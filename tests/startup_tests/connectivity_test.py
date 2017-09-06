@@ -182,7 +182,7 @@ def run():
     info(h2.cmd('dhclient ' + h2.defaultIntf().name))
 
     info('*** Making sure Mininet gets IPs...\n')
-    CLI(net, script='walk_s1')
+    CLI(net, script='sdcan/tests/startup_tests/walk_s1')
     #info('*** Exit CLI to start walk\n')
     #CLI(net)
 
