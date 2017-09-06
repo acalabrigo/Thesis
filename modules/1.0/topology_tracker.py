@@ -462,7 +462,7 @@ class DynamicTopology (EventMixin):
     if not packet.parsed:
       log.warning("%i %i ignoring unparsed packet", dpid, inport)
       return
-
+    log.warn("{0}".format(packet.type))
     if packet.type == ethernet.LLDP_TYPE: # Ignore LLDP packets
       return
 
