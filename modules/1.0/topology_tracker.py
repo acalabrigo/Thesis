@@ -411,7 +411,6 @@ class DynamicTopology (EventMixin):
           #self.delete_host_flows(host.ipaddr.ip, host.dpid)
         log.debug('{0} left'.format(str(host)))
         self.hosts.remove(host)
-        del self.graph[host.macaddr]
         self.graph.remove_node(m)
 
     elif move:
