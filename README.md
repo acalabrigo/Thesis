@@ -7,7 +7,7 @@ This repo contains a rough prototype for the SD-MCAN architecture, implemented a
 Requirements:
 
 - Python 2.7
-- NetworkX (get it [here](https://github.com/networkx/networkx.git)
+- NetworkX (get it [here](https://github.com/networkx/networkx.git))
 
 Usage:
 
