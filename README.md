@@ -4,6 +4,11 @@ This repo contains a rough prototype for the SD-MCAN architecture, implemented a
 
 <link coming pending publication>
 
+Requirements:
+
+- Python 2.7
+- NetworkX (get it [here](https://github.com/networkx/networkx.git)
+
 Usage:
 
 - ./pox.py sd-mcan
