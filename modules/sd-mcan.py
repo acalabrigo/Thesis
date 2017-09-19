@@ -1,4 +1,4 @@
-# Loads all modules and runs the controller. This is all that needs to be
+# Loads all SD-MCAN modules and runs the controller. This is all that needs to be
 # run on the POX CLI.
 
 # Modules are as follows:
@@ -8,12 +8,8 @@
 #   This thesis:
 #       - topology_tracker: dynamically tracks the entire topology, including
 #                           hosts and switches
-#       - mobile_host_tracker: built on top of the host_tracker module, this
-#                              tracks where hosts are in the network and raises
-#                              HostEvents
 #       - dhcp_server: handles all of the DHCP functionality of this system
 #       - route_manager: installs all flow entries into the switches
-
 # 2017 Adam Calabrigo
 
 import pox.topology

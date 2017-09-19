@@ -1,5 +1,6 @@
 # route_manager.py 2017 Adam Calabrigo
-# Install proactive flow rules based on topology_tracker and dhcp_server.
+# Install proactive and reactive flow rules based on topology_tracker
+# and dhcp_server.
 
 # POX
 from pox.core import core
@@ -18,8 +19,8 @@ log = core.getLogger()
 all_ports = of.OFPP_FLOOD
 GATEWAY_DUMMY_MAC = '03:00:00:00:be:ef'
 LABEL_START = 16
-
 LabelInfo = namedtuple('LabelInfo', 'dpid1 dpid2 dst_subnet')
+
 
 def dpid_to_mac (dpid):
   '''
@@ -306,6 +307,7 @@ class ProactiveFlows (object):
     # set a timeout and send
     #msg.idle_timeout = None # these flows are static
     self.topology_tracker.graph.node[info.dpid1]['connection'].send(msg)
+
 
 def launch (idle_timeout=10):
   if not core.hasComponent("route_manager"):

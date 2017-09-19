@@ -417,8 +417,11 @@ class DHCPDMulti (EventMixin):
         log.warn('No core mesh found in this network...')
         return
 
-      edges = [node for node in graph if node not in core and
-               not isinstance(node, str)]
+      edges = []
+      [edges.extend([x for x in graph.neighbors(c) if x not in core]) for c in core]
+
+      #edges = [node for node in graph if node not in core and
+      #       not isinstance(node, str)]
 
       for i,c in enumerate(edges):
         network_addr = IPAddr(self.network).toUnsigned() | (i << (32 - self.network_size))
