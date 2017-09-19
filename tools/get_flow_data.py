@@ -1,9 +1,9 @@
 #!/usr/bin/python
+# Adam Calabrigo 2017
 
 # Script to get the average number of flow table entries
 # in switches.
 
-# 2017 Adam Calabrigo
 
 import sys
 import subprocess

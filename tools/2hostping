@@ -1,0 +1,2 @@
+h1 ping -c 2 h2
+h2 ping -c 2 h1
