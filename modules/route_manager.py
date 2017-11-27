@@ -53,6 +53,7 @@ class ProactiveFlows (object):
     edge_switches = list(self.dhcp_server.edges)
 
     # install subnet-based rules between core switches
+    # TODO: optimize this, right now it doesn't matter
     for s1 in edge_switches:
       for s2 in [e for e in edge_switches if e != s1]:
         sp = shortest_path(graph, source = s1, target = s2)
